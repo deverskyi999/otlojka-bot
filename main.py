@@ -1,0 +1,2772 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import sqlite3
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from html import escape
+from typing import Iterator, Optional
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+)
+from dotenv import load_dotenv
+
+logger = logging.getLogger("codeschool")
+
+# ======================================================================
+# CONFIG
+# ======================================================================
+
+
+@dataclass
+class Settings:
+    bot_token: str
+    owner_id: int
+    db_path: str = "codeschool.db"
+    timezone_offset_hours: int = 3  # МСК по умолчанию — для напоминаний
+    trial_days: int = 3
+    default_price_stars: int = 150
+    ai_api_key: str = "imbek-9240f4b11ffe56d736c7691e253867ea1be2af6df6a62291"
+    ai_base_url: str = "https://api.imbek.fun/v1"
+    ai_model: str = "im-flash"
+    ai_max_tokens: int = 700
+    webapp_url: str = ""  # ссылка на захостенный terminal.html (Mini App)
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        load_dotenv()
+        bot_token = os.getenv("BOT_TOKEN")
+        if not bot_token:
+            raise RuntimeError("BOT_TOKEN is not set in environment (.env)")
+        owner_id_raw = os.getenv("OWNER_ID")
+        if not owner_id_raw:
+            raise RuntimeError("OWNER_ID is not set in environment (.env)")
+        return cls(
+            bot_token=bot_token,
+            owner_id=int(owner_id_raw),
+            db_path=os.getenv("DB_PATH", cls.db_path),
+            timezone_offset_hours=int(os.getenv("TIMEZONE_OFFSET_HOURS", cls.timezone_offset_hours)),
+            trial_days=int(os.getenv("TRIAL_DAYS", cls.trial_days)),
+            default_price_stars=int(os.getenv("SUB_PRICE_STARS", cls.default_price_stars)),
+            ai_api_key=os.getenv("AI_API_KEY", cls.ai_api_key),
+            ai_base_url=os.getenv("AI_BASE_URL", cls.ai_base_url),
+            ai_model=os.getenv("AI_MODEL", cls.ai_model),
+            ai_max_tokens=int(os.getenv("AI_MAX_TOKENS", cls.ai_max_tokens)),
+            webapp_url=os.getenv("WEBAPP_URL", cls.webapp_url),
+        )
+
+
+# ======================================================================
+# КОНТЕНТ КУРСОВ (статически в коде — просто редактировать/добавлять уроки)
+# ======================================================================
+# Каждый урок: title, content (объяснение, Markdown), task (практическое
+# задание, которое можно решить и проверить в мини-аппе с терминалом).
+
+# ======================================================================
+# КОНТЕНТ КУРСОВ (статически в коде — просто редактировать/добавлять уроки)
+# ======================================================================
+# Структура: язык -> несколько КУРСОВ -> в каждом курсе несколько уроков.
+# Курсы внутри языка проходятся по порядку (basics -> practice -> advanced),
+# следующий курс открывается после прохождения всех уроков предыдущего.
+
+_PY_BASICS = [
+    {"title": "1. Знакомство и первая программа", "content": (
+        "Python — один из самых популярных языков программирования: простой синтаксис, "
+        "огромное сообщество, используется в вебе, анализе данных, автоматизации, ИИ.\n\n"
+        "Программа на Python — это просто текстовый файл с расширением `.py`. Первая программа:\n\n"
+        "```python\nprint(\"Привет, мир!\")\n```\n\n"
+        "`print()` — функция, которая выводит текст на экран. Текст в кавычках называется "
+        "**строкой** (string)."
+    ), "task": "Выведи на экран своё имя с помощью print()."},
+    {"title": "2. Переменные и типы данных", "content": (
+        "Переменная — это имя, под которым хранится значение.\n\n"
+        "```python\nage = 16\nname = \"Аня\"\nheight = 170.5\nis_student = True\n```\n\n"
+        "Основные типы: `int` (целые числа), `float` (дробные), `str` (строки), "
+        "`bool` (True/False). Тип можно узнать функцией `type(x)`."
+    ), "task": "Создай переменные для имени, возраста и роста, выведи их все через print()."},
+    {"title": "3. Операторы и выражения", "content": (
+        "Арифметика: `+ - * /` (деление), `//` (целочисленное деление), `%` (остаток), "
+        "`**` (степень).\n\n"
+        "```python\nprint(7 // 2)   # 3\nprint(7 % 2)    # 1\nprint(2 ** 10)  # 1024\n```\n\n"
+        "Сравнения: `== != > < >= <=` возвращают `True`/`False`. Логика: `and`, `or`, `not`."
+    ), "task": "Посчитай, сколько полных недель и остаток дней в 100 днях (через // и %)."},
+    {"title": "4. Условия if/elif/else", "content": (
+        "```python\nage = 17\nif age >= 18:\n    print(\"Взрослый\")\nelif age >= 14:\n"
+        "    print(\"Подросток\")\nelse:\n    print(\"Ребёнок\")\n```\n\n"
+        "Важно: отступы (обычно 4 пробела) — это часть синтаксиса Python, а не украшение."
+    ), "task": "Напиши программу, которая по числу определяет: положительное, отрицательное или ноль."},
+    {"title": "5. Циклы for и while", "content": (
+        "```python\nfor i in range(5):\n    print(i)  # 0 1 2 3 4\n\ncount = 0\n"
+        "while count < 3:\n    print(\"работаем\")\n    count += 1\n```\n\n"
+        "`range(5)` — числа от 0 до 4. `break` прерывает цикл, `continue` — переходит к "
+        "следующей итерации."
+    ), "task": "Выведи все чётные числа от 1 до 20 с помощью for."},
+    {"title": "6. Списки (list)", "content": (
+        "```python\nfruits = [\"яблоко\", \"банан\", \"груша\"]\nfruits.append(\"киви\")\n"
+        "print(fruits[0])      # яблоко\nprint(len(fruits))    # 4\nfor f in fruits:\n"
+        "    print(f)\n```\n\n"
+        "Списки изменяемы, могут хранить что угодно, индексация с 0."
+    ), "task": "Создай список из 5 своих любимых фильмов/игр и выведи их пронумерованным списком."},
+    {"title": "7. Функции", "content": (
+        "```python\ndef greet(name):\n    return f\"Привет, {name}!\"\n\n"
+        "print(greet(\"Мир\"))\n```\n\n"
+        "Функция — переиспользуемый блок кода. `return` возвращает результат. "
+        "f-строки (`f\"...{x}...\"`) — удобный способ вставлять переменные в текст."
+    ), "task": "Напиши функцию is_even(n), которая возвращает True, если число чётное."},
+    {"title": "8. Мини-проект: калькулятор", "content": (
+        "Собираем всё вместе: переменные, условия, функции.\n\n"
+        "```python\ndef calculate(a, op, b):\n    if op == \"+\":\n        return a + b\n"
+        "    if op == \"-\":\n        return a - b\n    if op == \"*\":\n        return a * b\n"
+        "    if op == \"/\":\n        return a / b if b != 0 else \"Ошибка: деление на ноль\"\n"
+        "    return \"Неизвестная операция\"\n\nprint(calculate(10, \"+\", 5))\n```"
+    ), "task": "Допиши калькулятор: добавь операцию возведения в степень (**) и протестируй все случаи."},
+]
+
+_PY_PRACTICE = [
+    {"title": "1. Строки и их методы", "content": (
+        "У строк есть полезные методы:\n\n"
+        "```python\ns = \"  Привет, Мир  \"\nprint(s.strip())          # убирает пробелы по краям\n"
+        "print(s.lower())          # в нижний регистр\nprint(s.replace(\"Мир\", \"Питон\"))\n"
+        "print(\"a,b,c\".split(\",\"))  # ['a', 'b', 'c']\nprint(\"-\".join([\"a\", \"b\", \"c\"]))  # a-b-c\n```"
+    ), "task": "Дана строка с текстом через запятую (\"яблоко,банан,груша\") — раздели её на список и выведи каждое слово с большой буквы."},
+    {"title": "2. Словари (dict)", "content": (
+        "Словарь хранит пары «ключ → значение»:\n\n"
+        "```python\nperson = {\"name\": \"Аня\", \"age\": 16}\nprint(person[\"name\"])\n"
+        "person[\"city\"] = \"Москва\"\nfor key, value in person.items():\n    print(key, \"=\", value)\n```"
+    ), "task": "Создай словарь с ценами трёх товаров и выведи общую сумму всех цен."},
+    {"title": "3. Обработка ошибок (try/except)", "content": (
+        "Ошибки можно перехватывать, чтобы программа не падала:\n\n"
+        "```python\ntry:\n    number = int(input(\"Введите число: \"))\n    print(10 / number)\n"
+        "except ValueError:\n    print(\"Это не число!\")\nexcept ZeroDivisionError:\n"
+        "    print(\"На ноль делить нельзя!\")\n```"
+    ), "task": "Напиши функцию safe_divide(a, b), которая ловит деление на ноль и возвращает None вместо ошибки."},
+    {"title": "4. Работа с файлами", "content": (
+        "```python\nwith open(\"notes.txt\", \"w\", encoding=\"utf-8\") as f:\n"
+        "    f.write(\"Первая заметка\\n\")\n\nwith open(\"notes.txt\", \"r\", encoding=\"utf-8\") as f:\n"
+        "    print(f.read())\n```\n\n"
+        "`with` сам закрывает файл после использования — так безопаснее."
+    ), "task": "Запиши в файл 3 своих любимых цитаты (каждая на новой строке), затем прочитай и выведи файл целиком."},
+    {"title": "5. Мини-проект: список задач", "content": (
+        "Собираем словари, списки и циклы в мини-проект:\n\n"
+        "```python\ntasks = []\n\ndef add_task(text):\n    tasks.append({\"text\": text, \"done\": False})\n\n"
+        "def show_tasks():\n    for i, t in enumerate(tasks):\n        mark = \"✅\" if t[\"done\"] else \"⬜\"\n"
+        "        print(f\"{i}. {mark} {t['text']}\")\n\nadd_task(\"Выучить Python\")\nshow_tasks()\n```"
+    ), "task": "Добавь функцию complete_task(index), которая помечает задачу выполненной (done=True)."},
+]
+
+_PY_ADVANCED = [
+    {"title": "1. ООП: классы и объекты", "content": (
+        "Класс — это «чертёж» для создания объектов со своими данными и поведением:\n\n"
+        "```python\nclass Dog:\n    def __init__(self, name):\n        self.name = name\n\n"
+        "    def bark(self):\n        return f\"{self.name} говорит: Гав!\"\n\n"
+        "rex = Dog(\"Рекс\")\nprint(rex.bark())\n```"
+    ), "task": "Создай класс Car с атрибутами brand и speed, и методом accelerate(), увеличивающим speed на 10."},
+    {"title": "2. Наследование", "content": (
+        "Класс может наследовать поведение другого класса:\n\n"
+        "```python\nclass Animal:\n    def __init__(self, name):\n        self.name = name\n"
+        "    def speak(self):\n        return \"...\"\n\nclass Cat(Animal):\n    def speak(self):\n"
+        "        return f\"{self.name} говорит: Мяу!\"\n\nprint(Cat(\"Мурка\").speak())\n```"
+    ), "task": "Создай класс Bird, наследующий Animal, у которого speak() возвращает 'Чирик!'."},
+    {"title": "3. Модули и импорты", "content": (
+        "Код можно разбивать на файлы-модули и подключать их:\n\n"
+        "```python\nimport random\nprint(random.randint(1, 100))\n\nimport math\nprint(math.sqrt(16))\n```\n\n"
+        "Стандартная библиотека Python огромна — почти всё уже написано за тебя."
+    ), "task": "Используя модуль random, напиши игру «Угадай число от 1 до 10» (загадай через randint, сравнивай с вводом)."},
+    {"title": "4. List comprehensions", "content": (
+        "Компактный способ создавать списки:\n\n"
+        "```python\nsquares = [x ** 2 for x in range(10)]\nevens = [x for x in range(20) if x % 2 == 0]\n"
+        "print(squares)\nprint(evens)\n```\n\n"
+        "Это то же самое, что цикл for с append(), но короче и читабельнее."
+    ), "task": "Через list comprehension создай список кубов чисел от 1 до 10, которые делятся на 3."},
+    {"title": "5. Работа с библиотеками (pip)", "content": (
+        "`pip install название` ставит сторонние библиотеки. Например `requests` для запросов "
+        "в интернет:\n\n"
+        "```python\n# pip install requests\nimport requests\nresponse = requests.get(\"https://api.github.com\")\n"
+        "print(response.status_code)\n```\n\n"
+        "В терминале Mini App это работать не будет (там нет доступа к pip) — зато отлично "
+        "работает на установленном локально Python."
+    ), "task": "Найди в интернете любую простую библиотеку Python (например, emoji) и опиши в комментарии, что она делает."},
+]
+
+_JS_BASICS = [
+    {"title": "1. Знакомство и первая программа", "content": (
+        "JavaScript — язык веба: работает в браузере и на сервере (Node.js). Им написана "
+        "интерактивность практически всех сайтов.\n\n"
+        "```javascript\nconsole.log(\"Привет, мир!\");\n```\n\n"
+        "`console.log()` выводит значение — аналог `print()` в Python."
+    ), "task": "Выведи своё имя через console.log()."},
+    {"title": "2. Переменные let/const и типы", "content": (
+        "```javascript\nlet age = 16;\nconst name = \"Аня\";\nlet height = 170.5;\n"
+        "let isStudent = true;\n```\n\n"
+        "`let` — можно менять, `const` — нельзя (лучше использовать по умолчанию). "
+        "Типы: `number`, `string`, `boolean`, `object`, `undefined`."
+    ), "task": "Объяви переменные для имени, возраста, роста через let/const и выведи их."},
+    {"title": "3. Операторы и сравнения", "content": (
+        "Арифметика как в математике: `+ - * / %`. \n\n"
+        "Важно: используй `===` (строгое равенство), а не `==` — иначе JS будет "
+        "приводить типы неожиданным образом.\n\n"
+        "```javascript\nconsole.log(5 === \"5\"); // false\nconsole.log(5 == \"5\");  // true\n```"
+    ), "task": "Проверь через === и == сравнение true и 1 — объясни разницу в комментарии."},
+    {"title": "4. Условия if/else", "content": (
+        "```javascript\nlet age = 17;\nif (age >= 18) {\n    console.log(\"Взрослый\");\n"
+        "} else if (age >= 14) {\n    console.log(\"Подросток\");\n} else {\n"
+        "    console.log(\"Ребёнок\");\n}\n```"
+    ), "task": "Напиши программу, определяющую знак числа (положительное/отрицательное/ноль)."},
+    {"title": "5. Циклы for и while", "content": (
+        "```javascript\nfor (let i = 0; i < 5; i++) {\n    console.log(i);\n}\n\n"
+        "let count = 0;\nwhile (count < 3) {\n    console.log(\"работаем\");\n    count++;\n}\n```"
+    ), "task": "Выведи все чётные числа от 1 до 20 с помощью for."},
+    {"title": "6. Массивы (Array)", "content": (
+        "```javascript\nconst fruits = [\"яблоко\", \"банан\", \"груша\"];\n"
+        "fruits.push(\"киви\");\nconsole.log(fruits[0]);   // яблоко\n"
+        "console.log(fruits.length); // 4\nfruits.forEach(f => console.log(f));\n```"
+    ), "task": "Создай массив из 5 любимых фильмов/игр и выведи их через forEach."},
+    {"title": "7. Функции и стрелочные функции", "content": (
+        "```javascript\nfunction greet(name) {\n    return `Привет, ${name}!`;\n}\n\n"
+        "const greet2 = (name) => `Привет, ${name}!`;\n\nconsole.log(greet(\"Мир\"));\n```\n\n"
+        "Обратные кавычки (`` ` ``) — шаблонные строки, `${}` вставляет значение переменной."
+    ), "task": "Напиши функцию isEven(n), возвращающую true, если число чётное."},
+    {"title": "8. Мини-проект: калькулятор", "content": (
+        "```javascript\nfunction calculate(a, op, b) {\n    if (op === \"+\") return a + b;\n"
+        "    if (op === \"-\") return a - b;\n    if (op === \"*\") return a * b;\n"
+        "    if (op === \"/\") return b !== 0 ? a / b : \"Ошибка: деление на ноль\";\n"
+        "    return \"Неизвестная операция\";\n}\n\nconsole.log(calculate(10, \"+\", 5));\n```"
+    ), "task": "Допиши калькулятор: добавь возведение в степень (**) и протестируй все случаи."},
+]
+
+_JS_PRACTICE = [
+    {"title": "1. Строки и их методы", "content": (
+        "```javascript\nconst s = \"  Привет, Мир  \";\nconsole.log(s.trim());\n"
+        "console.log(s.toLowerCase());\nconsole.log(s.replace(\"Мир\", \"JS\"));\n"
+        "console.log(\"a,b,c\".split(\",\"));  // ['a','b','c']\n```"
+    ), "task": "Дана строка \"яблоко,банан,груша\" — раздели её через split и выведи каждое слово с большой буквы."},
+    {"title": "2. Объекты (object)", "content": (
+        "```javascript\nconst person = { name: \"Аня\", age: 16 };\nconsole.log(person.name);\n"
+        "person.city = \"Москва\";\nfor (const key in person) {\n    console.log(key, \"=\", person[key]);\n}\n```"
+    ), "task": "Создай объект с ценами трёх товаров и выведи их общую сумму."},
+    {"title": "3. Обработка ошибок (try/catch)", "content": (
+        "```javascript\ntry {\n    const number = JSON.parse(\"не число\");\n} catch (error) {\n"
+        "    console.log(\"Ошибка:\", error.message);\n}\n```\n\n"
+        "`try/catch` перехватывает ошибки, чтобы программа не «падала» целиком."
+    ), "task": "Напиши функцию safeDivide(a, b), которая через try/catch возвращает null при делении на ноль."},
+    {"title": "4. Массивы: методы поиска и изменения", "content": (
+        "```javascript\nconst nums = [1, 2, 3, 4, 5];\nconsole.log(nums.includes(3));  // true\n"
+        "console.log(nums.indexOf(4));   // 3\nconsole.log(nums.reverse());    // [5,4,3,2,1]\n```"
+    ), "task": "Дан массив чисел — найди в нём максимальное значение без использования Math.max (через цикл)."},
+    {"title": "5. Мини-проект: список задач", "content": (
+        "```javascript\nconst tasks = [];\n\nfunction addTask(text) {\n"
+        "    tasks.push({ text, done: false });\n}\n\nfunction showTasks() {\n"
+        "    tasks.forEach((t, i) => {\n        const mark = t.done ? \"✅\" : \"⬜\";\n"
+        "        console.log(`${i}. ${mark} ${t.text}`);\n    });\n}\n\naddTask(\"Выучить JS\");\nshowTasks();\n```"
+    ), "task": "Добавь функцию completeTask(index), которая помечает задачу выполненной (done=true)."},
+]
+
+_JS_ADVANCED = [
+    {"title": "1. Классы (class)", "content": (
+        "```javascript\nclass Dog {\n    constructor(name) {\n        this.name = name;\n    }\n"
+        "    bark() {\n        return `${this.name} говорит: Гав!`;\n    }\n}\n\n"
+        "const rex = new Dog(\"Рекс\");\nconsole.log(rex.bark());\n```"
+    ), "task": "Создай класс Car с полями brand и speed, и методом accelerate(), увеличивающим speed на 10."},
+    {"title": "2. Асинхронность: Promise и async/await", "content": (
+        "```javascript\nfunction wait(ms) {\n    return new Promise(resolve => setTimeout(resolve, ms));\n}\n\n"
+        "async function main() {\n    console.log(\"Начали\");\n    await wait(1000);\n"
+        "    console.log(\"Прошла секунда\");\n}\n\nmain();\n```\n\n"
+        "`async/await` — способ писать асинхронный код так, будто он последовательный."
+    ), "task": "Напиши async-функцию, которая ждёт 2 секунды и затем выводит 'Готово!'."},
+    {"title": "3. Массивы: map, filter, reduce", "content": (
+        "```javascript\nconst nums = [1, 2, 3, 4, 5];\nconst doubled = nums.map(n => n * 2);\n"
+        "const evens = nums.filter(n => n % 2 === 0);\nconst sum = nums.reduce((acc, n) => acc + n, 0);\n"
+        "console.log(doubled, evens, sum);\n```"
+    ), "task": "Используя map и filter, из массива слов оставь только те, что длиннее 4 букв, и переведи их в верхний регистр."},
+    {"title": "4. JSON: работа с данными", "content": (
+        "```javascript\nconst obj = { name: \"Аня\", age: 16 };\nconst json = JSON.stringify(obj);\n"
+        "console.log(json);            // '{\"name\":\"Аня\",\"age\":16}'\nconst back = JSON.parse(json);\n"
+        "console.log(back.name);       // Аня\n```\n\n"
+        "JSON — универсальный формат обмена данными между сервером и клиентом."
+    ), "task": "Преврати массив из 3 объектов (имя+возраст) в JSON-строку и обратно, выведи результат."},
+    {"title": "5. Модули (import/export)", "content": (
+        "```javascript\n// math.js\nexport function square(x) {\n    return x * x;\n}\n\n"
+        "// main.js\nimport { square } from \"./math.js\";\nconsole.log(square(5));\n```\n\n"
+        "Модули помогают разбивать большой проект на независимые файлы."
+    ), "task": "Опиши в комментариях, какие 2 функции ты бы вынес в отдельный модуль utils.js в своём проекте и почему."},
+]
+
+_CPP_BASICS = [
+    {"title": "1. Знакомство и первая программа", "content": (
+        "C++ — быстрый компилируемый язык: игры, системы, embedded, высокопроизводительные "
+        "приложения. Синтаксис строже, чем у Python/JS.\n\n"
+        "```cpp\n#include <iostream>\nusing namespace std;\n\nint main() {\n"
+        "    cout << \"Привет, мир!\" << endl;\n    return 0;\n}\n```\n\n"
+        "`#include` подключает библиотеки, `main()` — точка входа программы."
+    ), "task": "Выведи своё имя через cout."},
+    {"title": "2. Переменные и типы данных", "content": (
+        "В C++ у каждой переменной строгий тип, который указывается явно:\n\n"
+        "```cpp\nint age = 16;\nstring name = \"Аня\";\ndouble height = 170.5;\n"
+        "bool isStudent = true;\n```\n\n"
+        "Основные типы: `int`, `double`/`float`, `string` (нужен `#include <string>`), `bool`, `char`."
+    ), "task": "Объяви переменные для имени, возраста и роста, выведи их через cout."},
+    {"title": "3. Операторы и сравнения", "content": (
+        "```cpp\nint a = 7, b = 2;\ncout << a / b << endl;   // 3 (целочисленное деление!)\n"
+        "cout << a % b << endl;   // 1\n```\n\n"
+        "Внимание: деление `int / int` в C++ ВСЕГДА целочисленное — дробная часть отбрасывается."
+    ), "task": "Посчитай сколько полных недель и остаток дней в 100 днях (через / и %)."},
+    {"title": "4. Условия if/else if/else", "content": (
+        "```cpp\nint age = 17;\nif (age >= 18) {\n    cout << \"Взрослый\";\n"
+        "} else if (age >= 14) {\n    cout << \"Подросток\";\n} else {\n"
+        "    cout << \"Ребёнок\";\n}\n```"
+    ), "task": "Напиши программу, определяющую знак числа (положительное/отрицательное/ноль)."},
+    {"title": "5. Циклы for и while", "content": (
+        "```cpp\nfor (int i = 0; i < 5; i++) {\n    cout << i << endl;\n}\n\n"
+        "int count = 0;\nwhile (count < 3) {\n    cout << \"работаем\" << endl;\n"
+        "    count++;\n}\n```"
+    ), "task": "Выведи все чётные числа от 1 до 20 с помощью for."},
+    {"title": "6. Массивы и vector", "content": (
+        "```cpp\n#include <vector>\nvector<string> fruits = {\"яблоко\", \"банан\", \"груша\"};\n"
+        "fruits.push_back(\"киви\");\ncout << fruits[0] << endl;\ncout << fruits.size() << endl;\n"
+        "for (string f : fruits) {\n    cout << f << endl;\n}\n```\n\n"
+        "`vector` — динамический массив (в отличие от обычного `array` с фиксированным размером)."
+    ), "task": "Создай vector из 5 любимых фильмов/игр и выведи их в цикле."},
+    {"title": "7. Функции", "content": (
+        "```cpp\nstring greet(string name) {\n    return \"Привет, \" + name + \"!\";\n}\n\n"
+        "int main() {\n    cout << greet(\"Мир\") << endl;\n    return 0;\n}\n```\n\n"
+        "У функции обязательно указывается тип возвращаемого значения (или `void`, если ничего не возвращает)."
+    ), "task": "Напиши функцию bool isEven(int n), возвращающую true, если число чётное."},
+    {"title": "8. Мини-проект: калькулятор", "content": (
+        "```cpp\ndouble calculate(double a, char op, double b) {\n"
+        "    if (op == '+') return a + b;\n    if (op == '-') return a - b;\n"
+        "    if (op == '*') return a * b;\n    if (op == '/') return b != 0 ? a / b : 0;\n"
+        "    return 0;\n}\n\nint main() {\n    cout << calculate(10, '+', 5) << endl;\n"
+        "    return 0;\n}\n```"
+    ), "task": "Допиши калькулятор: обработай деление на ноль отдельным сообщением через cout."},
+]
+
+_CPP_PRACTICE = [
+    {"title": "1. Строки (std::string)", "content": (
+        "```cpp\n#include <string>\nstring s = \"Привет, Мир\";\ncout << s.length() << endl;\n"
+        "cout << s.substr(0, 6) << endl;   // Привет\ns += \"!\";\ncout << s << endl;\n```"
+    ), "task": "Дана строка с именем — выведи количество символов в ней и первую букву отдельно."},
+    {"title": "2. Структуры (struct)", "content": (
+        "```cpp\nstruct Person {\n    string name;\n    int age;\n};\n\nint main() {\n"
+        "    Person p;\n    p.name = \"Аня\";\n    p.age = 16;\n"
+        "    cout << p.name << \" - \" << p.age << endl;\n    return 0;\n}\n```\n\n"
+        "`struct` группирует несколько переменных разных типов в одну единицу."
+    ), "task": "Создай struct Book с полями title и pages, заполни данными и выведи их."},
+    {"title": "3. Указатели — основы", "content": (
+        "```cpp\nint x = 10;\nint* p = &x;      // p хранит АДРЕС x\ncout << *p << endl;  // 10 (значение по адресу)\n"
+        "*p = 20;\ncout << x << endl;   // 20 (x изменился через указатель!)\n```\n\n"
+        "Указатели — то, что отличает C++ от многих других языков. Не пугайся, это просто "
+        "«адрес в памяти»."
+    ), "task": "Объяви переменную и указатель на неё, измени значение через указатель, выведи результат."},
+    {"title": "4. Работа с файлами (fstream)", "content": (
+        "```cpp\n#include <fstream>\nofstream out(\"notes.txt\");\nout << \"Первая заметка\" << endl;\n"
+        "out.close();\n\nifstream in(\"notes.txt\");\nstring line;\ngetline(in, line);\ncout << line << endl;\n```"
+    ), "task": "Запиши в файл 3 строки текста, затем прочитай и выведи их все."},
+    {"title": "5. Мини-проект: список задач", "content": (
+        "```cpp\n#include <vector>\n#include <string>\nstruct Task { string text; bool done; };\n\n"
+        "int main() {\n    vector<Task> tasks;\n    tasks.push_back({\"Выучить C++\", false});\n"
+        "    for (int i = 0; i < tasks.size(); i++) {\n"
+        "        cout << i << \". \" << (tasks[i].done ? \"[x] \" : \"[ ] \") << tasks[i].text << endl;\n"
+        "    }\n    return 0;\n}\n```"
+    ), "task": "Добавь ещё 2 задачи в vector и отметь одну из них выполненной (done = true)."},
+]
+
+_CPP_ADVANCED = [
+    {"title": "1. Классы и объекты (ООП)", "content": (
+        "```cpp\nclass Dog {\npublic:\n    string name;\n    Dog(string n) { name = n; }\n"
+        "    string bark() { return name + \" говорит: Гав!\"; }\n};\n\nint main() {\n"
+        "    Dog rex(\"Рекс\");\n    cout << rex.bark() << endl;\n    return 0;\n}\n```"
+    ), "task": "Создай класс Car с полями brand и speed, и методом accelerate(), увеличивающим speed на 10."},
+    {"title": "2. Наследование", "content": (
+        "```cpp\nclass Animal {\npublic:\n    string name;\n    Animal(string n) { name = n; }\n"
+        "    virtual string speak() { return \"...\"; }\n};\n\nclass Cat : public Animal {\npublic:\n"
+        "    Cat(string n) : Animal(n) {}\n    string speak() override { return name + \" говорит: Мяу!\"; }\n};\n```"
+    ), "task": "Создай класс Bird, наследующий Animal, у которого speak() возвращает 'Чирик!'."},
+    {"title": "3. Шаблоны функций (templates)", "content": (
+        "```cpp\ntemplate <typename T>\nT maxValue(T a, T b) {\n    return a > b ? a : b;\n}\n\n"
+        "int main() {\n    cout << maxValue(3, 7) << endl;       // работает с int\n"
+        "    cout << maxValue(3.5, 2.1) << endl;   // и с double тоже!\n    return 0;\n}\n```\n\n"
+        "Шаблоны позволяют писать одну функцию, работающую с разными типами данных."
+    ), "task": "Напиши шаблонную функцию minValue(a, b), возвращающую меньшее из двух значений."},
+    {"title": "4. STL контейнеры: map", "content": (
+        "```cpp\n#include <map>\nmap<string, int> ages;\nages[\"Аня\"] = 16;\nages[\"Иван\"] = 17;\n\n"
+        "for (auto& pair : ages) {\n    cout << pair.first << \" - \" << pair.second << endl;\n}\n```\n\n"
+        "`map` — аналог словаря из Python: хранит пары «ключ → значение»."
+    ), "task": "Создай map с ценами трёх товаров и выведи их общую сумму."},
+    {"title": "5. Обработка исключений (try/catch)", "content": (
+        "```cpp\ntry {\n    int a = 10, b = 0;\n    if (b == 0) throw runtime_error(\"Деление на ноль!\");\n"
+        "    cout << a / b;\n} catch (const runtime_error& e) {\n    cout << \"Ошибка: \" << e.what() << endl;\n}\n```"
+    ), "task": "Напиши функцию safeDivide(a, b), которая через throw/catch обрабатывает деление на ноль."},
+]
+
+LANGUAGES: dict[str, dict] = {
+    "python": {
+        "title": "Python", "emoji_fallback": "🐍",
+        "piston_lang": "python", "piston_version": "3.10.0",
+        "courses": {
+            "basics": {"title": "Основы Python", "lessons": _PY_BASICS},
+            "practice": {"title": "Практика: мини-проекты", "lessons": _PY_PRACTICE},
+            "advanced": {"title": "Продвинутый уровень", "lessons": _PY_ADVANCED},
+        },
+    },
+    "javascript": {
+        "title": "JavaScript", "emoji_fallback": "📜",
+        "piston_lang": "javascript", "piston_version": "18.15.0",
+        "courses": {
+            "basics": {"title": "Основы JavaScript", "lessons": _JS_BASICS},
+            "practice": {"title": "Практика: мини-проекты", "lessons": _JS_PRACTICE},
+            "advanced": {"title": "Продвинутый уровень", "lessons": _JS_ADVANCED},
+        },
+    },
+    "cpp": {
+        "title": "C++", "emoji_fallback": "⚙️",
+        "piston_lang": "cpp", "piston_version": "10.2.0",
+        "courses": {
+            "basics": {"title": "Основы C++", "lessons": _CPP_BASICS},
+            "practice": {"title": "Практика: мини-проекты", "lessons": _CPP_PRACTICE},
+            "advanced": {"title": "Продвинутый уровень", "lessons": _CPP_ADVANCED},
+        },
+    },
+}
+
+# Порядок прохождения курсов внутри языка (следующий открывается по завершении предыдущего)
+COURSE_ORDER = ["basics", "practice", "advanced"]
+
+POINTS_PER_LESSON = 10
+DAILY_UNLOCK_HOURS = 24  # раз в сутки открывается следующий урок
+
+
+def get_course(lang_key: str, course_key: str) -> Optional[dict]:
+    lang = LANGUAGES.get(lang_key)
+    if not lang:
+        return None
+    return lang["courses"].get(course_key)
+
+
+def get_lesson(lang_key: str, course_key: str, idx: int) -> Optional[dict]:
+    course = get_course(lang_key, course_key)
+    if not course:
+        return None
+    lessons = course["lessons"]
+    if 0 <= idx < len(lessons):
+        return lessons[idx]
+    return None
+
+
+def next_course_key(course_key: str) -> Optional[str]:
+    try:
+        i = COURSE_ORDER.index(course_key)
+    except ValueError:
+        return None
+    return COURSE_ORDER[i + 1] if i + 1 < len(COURSE_ORDER) else None
+
+
+
+# ======================================================================
+# ПРЕМИУМ-ЭМОДЗИ: ЛЮБОЙ текст/кнопку можно переопределить премиум-эмодзи
+# через админ-панель. {emoji:key} в тексте / _btn(db, key, ...) для кнопок.
+# ======================================================================
+
+DEFAULT_EMOJI: dict[str, tuple[str, str]] = {
+    "welcome_icon": ("5461070949816291881", "👋"),
+    "courses_icon": ("5215212253138604899", "📚"),
+    "star": ("5952066863931331270", "⭐"),
+    "ai_icon": ("5168182418414240475", "🤖"),
+    "profile_icon": ("", "👤"),
+    "top_icon": ("", "🏆"),
+    "reminder_icon": ("", "⏰"),
+    "buy_icon": ("", "⭐"),
+    "help_icon": ("", "ℹ️"),
+    "terminal_icon": ("", "💻"),
+    "admin_icon": ("", "🔐"),
+    "promo_icon": ("", "🎁"),
+}
+
+# Человекочитаемые подписи для дефолтных слотов (только для лейбла в
+# админке; сама админка НЕ ограничена этим списком — админ может добавить
+# премиум-эмодзи на любой свой текст через "➕ Добавить свой" со своим ключом).
+TEXT_EMOJI_LABELS: dict[str, str] = {
+    "welcome_icon": "Приветствие: иконка",
+    "courses_icon": "Меню курсов: иконка",
+    "ai_icon": "ИИ-помощник: иконка",
+    "profile_icon": "Профиль: иконка",
+    "top_icon": "Топ: иконка",
+    "reminder_icon": "Напоминания: иконка",
+    "buy_icon": "Покупка/подписка: иконка",
+    "help_icon": "Помощь (/help): иконка",
+    "terminal_icon": "Мини-терминал: иконка",
+    "admin_icon": "Админ-панель: иконка",
+    "promo_icon": "Промокоды: иконка",
+}
+
+# Оставлено для обратной совместимости — админ-клавиатура теперь строится
+# динамически из БД (см. build_emoji_admin_keyboard), а не из этого списка.
+TEXT_EMOJI_KEYS: list[tuple[str, str]] = [(k, v) for k, v in TEXT_EMOJI_LABELS.items()]
+
+TEXT_EMOJI_FALLBACKS: dict[str, str] = {k: v[1] for k, v in DEFAULT_EMOJI.items()}
+
+
+# ======================================================================
+# ИИ-ПОМОЩНИК (OpenAI-совместимый API) + Markdown → Telegram HTML
+# ======================================================================
+
+
+DEFAULT_AI_SYSTEM_PROMPT = (
+    "Ты — учебный ИИ-помощник в боте CodeSchool. Твоя единственная задача — помогать "
+    "изучать программирование (Python, JavaScript, C++): объяснять код, синтаксис, ошибки, "
+    "концепции, помогать с заданиями из уроков.\n\n"
+    "СТРОГОЕ ПРАВИЛО: если вопрос НЕ связан с программированием, учёбой или самим ботом "
+    "(например: сказки, истории, факты о странах, знаменитости, отвлечённые темы, "
+    "личные советы не по теме кода и т.п.) — НЕ отвечай по существу этого вопроса. "
+    "Вместо этого вежливо ответь примерно так: «Извините, это не по теме 🙂 Я создан для того, "
+    "чтобы помогать вам изучать программирование — задайте вопрос по коду, урокам или заданиям!» "
+    "Не делай исключений, даже если пользователь настаивает или просит \"just this once\".\n\n"
+    "Если вопрос по теме — отвечай кратко, понятно, по делу, с примерами кода через Markdown "
+    "(```язык ... ```), дружелюбно, без лишних вступлений, как опытный разработчик-наставник, "
+    "который старается объяснить максимально просто и с примерами.\n\n"
+    "ВАЖНО про уроки: НЕ рассказывай и не пересказывай содержание уроков, которые ученик ещё "
+    "не открыл и не проходил (если тебе не передан их текст явно в контексте ниже как пройденный/"
+    "текущий урок). Если ученик просит рассказать про урок, который дальше по программе — мягко "
+    "объясни, что материал усваивается лучше, если проходить уроки по порядку, и предложи "
+    "вернуться к этому уроку, когда он откроется, но не заставляй и не отказывай грубо."
+)
+
+
+async def _ai_chat_completion(
+    settings: "Settings",
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    timeout_seconds: int = 25,
+    db: Optional["Database"] = None,
+) -> Optional[str]:
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        headers = {"Authorization": f"Bearer {settings.ai_api_key}", "Content-Type": "application/json"}
+        model = settings.ai_model
+        if db is not None:
+            override = db.get_setting("ai_model_override", "")
+            if override:
+                model = override
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt or DEFAULT_AI_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_tokens or settings.ai_max_tokens,
+        }
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.post(f"{settings.ai_base_url}/chat/completions", json=payload) as resp:
+                if resp.status != 200:
+                    logger.error("AI API status %s: %s", resp.status, await resp.text())
+                    return None
+                data = await resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return None
+        content = (choices[0].get("message") or {}).get("content")
+        return content.strip() if content else None
+    except Exception:
+        logger.exception("AI chat completion failed")
+        return None
+
+
+# ======================================================================
+# CRYPTOBOT (Crypto Pay API) — https://help.crypt.bot/crypto-pay-api
+# ======================================================================
+
+CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
+
+
+async def cryptobot_create_invoice(token: str, amount_usd: float, description: str, payload: str) -> Optional[dict]:
+    """Создаёт инвойс в CryptoBot. Возвращает dict с полями invoice_id/pay_url или None при ошибке."""
+    try:
+        headers = {"Crypto-Pay-API-Token": token, "Content-Type": "application/json"}
+        body = {
+            "currency_type": "fiat",
+            "fiat": "USD",
+            "amount": f"{amount_usd:.2f}",
+            "accepted_assets": "USDT,TON,BTC",
+            "description": description,
+            "payload": payload,
+            "expires_in": 3600,
+        }
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(f"{CRYPTO_PAY_BASE_URL}/createInvoice", json=body) as resp:
+                data = await resp.json()
+        if not data.get("ok"):
+            logger.error("CryptoBot createInvoice failed: %s", data)
+            return None
+        result = data["result"]
+        return {"invoice_id": result["invoice_id"], "pay_url": result.get("bot_invoice_url") or result.get("pay_url")}
+    except Exception:
+        logger.exception("CryptoBot createInvoice error")
+        return None
+
+
+async def cryptobot_check_invoice(token: str, invoice_id: int) -> Optional[str]:
+    """Возвращает статус инвойса: 'paid' / 'active' / 'expired' / None при ошибке."""
+    try:
+        headers = {"Crypto-Pay-API-Token": token}
+        params = {"invoice_ids": str(invoice_id)}
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(f"{CRYPTO_PAY_BASE_URL}/getInvoices", params=params) as resp:
+                data = await resp.json()
+        if not data.get("ok"):
+            return None
+        items = data["result"]["items"]
+        if not items:
+            return None
+        return items[0]["status"]
+    except Exception:
+        logger.exception("CryptoBot getInvoices error")
+        return None
+
+
+_MD_CODE_BLOCK_RE = re.compile(r"```(\w*)\n?(.*?)```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")
+_MD_HEADER_RE = re.compile(r"^#{1,6}\s*(.+)$", re.MULTILINE)
+
+
+def _markdown_to_telegram_html(text: str) -> str:
+    blocks: list[str] = []
+
+    def _stash_code_block(m: "re.Match[str]") -> str:
+        lang, code = m.group(1), m.group(2)
+        code = code.strip("\n")
+        cls = f' class="language-{escape(lang)}"' if lang else ""
+        blocks.append(f"<pre><code{cls}>{escape(code)}</code></pre>")
+        return f"\x00{len(blocks) - 1}\x00"
+
+    def _stash_inline_code(m: "re.Match[str]") -> str:
+        blocks.append(f"<code>{escape(m.group(1))}</code>")
+        return f"\x00{len(blocks) - 1}\x00"
+
+    text = _MD_CODE_BLOCK_RE.sub(_stash_code_block, text)
+    text = _MD_INLINE_CODE_RE.sub(_stash_inline_code, text)
+    text = escape(text)
+    text = _MD_HEADER_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = _MD_BOLD_RE.sub(lambda m: f"<b>{m.group(1) or m.group(2)}</b>", text)
+    text = _MD_ITALIC_RE.sub(lambda m: f"<i>{m.group(1) or m.group(2)}</i>", text)
+
+    def _restore(m: "re.Match[str]") -> str:
+        return blocks[int(m.group(1))]
+
+    text = re.sub(r"\x00(\d+)\x00", _restore, text)
+    return text.strip()
+
+
+# ======================================================================
+# DATABASE
+# ======================================================================
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self._path = path
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self._path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init_schema(self, owner_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    first_name TEXT NOT NULL DEFAULT '',
+                    username TEXT,
+                    joined_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    reminder_time TEXT,
+                    reminder_enabled INTEGER NOT NULL DEFAULT 0,
+                    last_reminder_date TEXT,
+                    sub_until INTEGER,
+                    trial_used INTEGER NOT NULL DEFAULT 0,
+                    points INTEGER NOT NULL DEFAULT 0,
+                    daily_lesson_limit INTEGER NOT NULL DEFAULT 3,
+                    lessons_done_today INTEGER NOT NULL DEFAULT 0,
+                    lessons_done_date TEXT
+                )
+                """
+            )
+            # миграция для уже существующих БД, где этих колонок ещё нет
+            for ddl in (
+                "ALTER TABLE users ADD COLUMN daily_lesson_limit INTEGER NOT NULL DEFAULT 3",
+                "ALTER TABLE users ADD COLUMN lessons_done_today INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN lessons_done_date TEXT",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass  # колонка уже существует
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS progress (
+                    user_id INTEGER NOT NULL,
+                    lang_key TEXT NOT NULL,
+                    course_key TEXT NOT NULL,
+                    lesson_index INTEGER NOT NULL DEFAULT 0,
+                    unlocked_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    PRIMARY KEY (user_id, lang_key, course_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS emoji (
+                    key TEXT PRIMARY KEY,
+                    emoji_id TEXT NOT NULL,
+                    fallback TEXT NOT NULL DEFAULT '⭐'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    code TEXT PRIMARY KEY,
+                    days INTEGER NOT NULL,
+                    max_activations INTEGER NOT NULL,
+                    activations_count INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS promo_activations (
+                    code TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    activated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    PRIMARY KEY (code, user_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount TEXT NOT NULL,
+                    charge_id TEXT,
+                    provider TEXT NOT NULL DEFAULT 'stars',
+                    invoice_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'paid',
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                )
+                """
+            )
+            for ddl in (
+                "ALTER TABLE payments ADD COLUMN provider TEXT NOT NULL DEFAULT 'stars'",
+                "ALTER TABLE payments ADD COLUMN invoice_id TEXT",
+                "ALTER TABLE payments ADD COLUMN status TEXT NOT NULL DEFAULT 'paid'",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
+            for key, (emoji_id, fallback) in DEFAULT_EMOJI.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO emoji (key, emoji_id, fallback) VALUES (?, ?, ?)",
+                    (key, emoji_id, fallback),
+                )
+            defaults = {
+                "price_stars": str(150),
+                "stars_enabled": "1",
+                "subscription_required": "0",  # 0 = всё бесплатно, 1 = курс "basics" бесплатный, дальше по подписке
+                "owner_id": str(owner_id),
+                "crypto_pay_token": "",  # ключ CryptoBot (Crypto Pay API), вставляется в админке
+                "price_usd": "5",  # цена подписки в USD для оплаты через CryptoBot
+                "sub_days": "30",
+                "subscription_strict": "0",  # 1 = подпиской закрыт даже первый (пробный) курс
+                "unlimited_lessons": "0",  # 1 = без дневного лимита и без ожидания следующего урока
+                "channel_username": "",  # юзернейм канала для кнопки "Подписаться"
+                "ai_model_override": "",  # если задано в админке — используется вместо settings.ai_model
+            }
+            for key, val in defaults.items():
+                conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
+
+    # -- users ----------------------------------------------------------
+    def upsert_user(self, user_id: int, first_name: str, username: Optional[str]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (user_id, first_name, username) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name, username = excluded.username
+                """,
+                (user_id, first_name, username),
+            )
+
+    def get_user(self, user_id: int) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+    def all_user_ids(self) -> list[int]:
+        with self.connect() as conn:
+            return [r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+
+    def users_with_reminder(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM users WHERE reminder_enabled = 1 AND reminder_time IS NOT NULL"
+            ).fetchall()
+
+    def set_reminder(self, user_id: int, time_str: Optional[str], enabled: bool) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE users SET reminder_time = ?, reminder_enabled = ? WHERE user_id = ?",
+                (time_str, int(enabled), user_id),
+            )
+
+    def mark_reminder_sent(self, user_id: int, date_str: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET last_reminder_date = ? WHERE user_id = ?", (date_str, user_id))
+
+    def user_count(self) -> int:
+        with self.connect() as conn:
+            return conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+
+    def active_subscribers_count(self) -> int:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE sub_until IS NOT NULL AND sub_until > strftime('%s','now')"
+            ).fetchone()["c"]
+
+    def is_subscribed(self, user_id: int, owner_id: int) -> bool:
+        if user_id == owner_id:
+            return True
+        row = self.get_user(user_id)
+        if not row or not row["sub_until"]:
+            return False
+        return row["sub_until"] > int(time.time())
+
+    def grant_subscription(self, user_id: int, days: int) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT sub_until FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            now = int(time.time())
+            base = row["sub_until"] if row and row["sub_until"] and row["sub_until"] > now else now
+            new_until = base + days * 86400
+            conn.execute("UPDATE users SET sub_until = ? WHERE user_id = ?", (new_until, user_id))
+            return new_until
+
+    def trial_available(self, user_id: int) -> bool:
+        row = self.get_user(user_id)
+        return bool(row and not row["trial_used"])
+
+    def use_trial(self, user_id: int, days: int) -> int:
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user_id,))
+        return self.grant_subscription(user_id, days)
+
+    def record_payment(self, user_id: int, amount: str, charge_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO payments (user_id, amount, charge_id, provider, status) VALUES (?, ?, ?, 'stars', 'paid')",
+                (user_id, amount, charge_id),
+            )
+
+    # -- CryptoBot (Crypto Pay API) ---------------------------------------
+    def create_pending_crypto_payment(self, user_id: int, invoice_id: str, amount_usd: float) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO payments (user_id, amount, invoice_id, provider, status) VALUES (?, ?, ?, 'crypto', 'pending')",
+                (user_id, f"{amount_usd:.2f} USD", str(invoice_id)),
+            )
+
+    def get_pending_crypto_payment(self, invoice_id: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM payments WHERE invoice_id = ? AND provider = 'crypto'",
+                (str(invoice_id),),
+            ).fetchone()
+
+    def mark_crypto_payment_paid(self, invoice_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE payments SET status = 'paid' WHERE invoice_id = ? AND provider = 'crypto'",
+                (str(invoice_id),),
+            )
+
+    def all_pending_crypto_payments(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM payments WHERE provider = 'crypto' AND status = 'pending'"
+            ).fetchall()
+
+    # -- progress ---------------------------------------------------------
+    def get_progress_row(self, user_id: int, lang_key: str, course_key: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM progress WHERE user_id = ? AND lang_key = ? AND course_key = ?",
+                (user_id, lang_key, course_key),
+            ).fetchone()
+
+    def start_course(self, user_id: int, lang_key: str, course_key: str) -> None:
+        """Создаёт запись прогресса, если её ещё нет (урок 0 доступен сразу)."""
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO progress (user_id, lang_key, course_key, lesson_index) VALUES (?, ?, ?, 0)",
+                (user_id, lang_key, course_key),
+            )
+
+    def advance_progress(self, user_id: int, lang_key: str, course_key: str, new_index: int) -> None:
+        """Отмечает, что открылся урок new_index — обновляет unlocked_at (для суточного лимита)."""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO progress (user_id, lang_key, course_key, lesson_index, unlocked_at, updated_at)
+                VALUES (?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))
+                ON CONFLICT(user_id, lang_key, course_key) DO UPDATE SET
+                    lesson_index = MAX(progress.lesson_index, excluded.lesson_index),
+                    unlocked_at = CASE WHEN excluded.lesson_index > progress.lesson_index
+                                       THEN strftime('%s','now') ELSE progress.unlocked_at END,
+                    updated_at = strftime('%s','now')
+                """,
+                (user_id, lang_key, course_key, new_index),
+            )
+
+    # -- дневной лимит уроков (настраивается пользователем в профиле) ------
+    DAILY_LIMIT_CHOICES: tuple[int, ...] = (1, 2, 3, 5, 10, 0)  # 0 = без ограничений
+
+    def daily_limit_status(self, user_id: int) -> tuple[int, int]:
+        """Возвращает (лимит, сколько новых уроков уже пройдено сегодня).
+        Сбрасывает счётчик, если наступил новый день."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT daily_lesson_limit, lessons_done_today, lessons_done_date FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return 3, 0
+            if row["lessons_done_date"] != today:
+                conn.execute(
+                    "UPDATE users SET lessons_done_today = 0, lessons_done_date = ? WHERE user_id = ?",
+                    (today, user_id),
+                )
+                return row["daily_lesson_limit"], 0
+            return row["daily_lesson_limit"], row["lessons_done_today"]
+
+    def try_consume_daily_lesson(self, user_id: int) -> bool:
+        """Пытается зачесть один НОВЫЙ пройденный урок в дневной лимит.
+        Возвращает False, если лимит уже исчерпан (и ничего не меняет)."""
+        limit, done = self.daily_limit_status(user_id)
+        if limit and done >= limit:
+            return False
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE users SET lessons_done_today = lessons_done_today + 1, lessons_done_date = ? WHERE user_id = ?",
+                (today, user_id),
+            )
+        return True
+
+    def set_daily_lesson_limit(self, user_id: int, limit: int) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET daily_lesson_limit = ? WHERE user_id = ?", (limit, user_id))
+
+    def all_progress(self, user_id: int) -> dict[tuple[str, str], sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM progress WHERE user_id = ?", (user_id,)
+            ).fetchall()
+            return {(r["lang_key"], r["course_key"]): r for r in rows}
+
+    # -- очки / топ пользователей -----------------------------------------
+    def add_points(self, user_id: int, amount: int) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, user_id))
+
+    def top_users(self, limit: int = 10) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT user_id, first_name, username, points FROM users "
+                "WHERE points > 0 ORDER BY points DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    def user_rank(self, user_id: int) -> tuple[int, int]:
+        """Возвращает (место, очки) пользователя среди всех с points > 0."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT points FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            points = row["points"] if row else 0
+            if points <= 0:
+                return (0, 0)
+            rank = conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE points > ?", (points,)
+            ).fetchone()["c"] + 1
+            return (rank, points)
+
+    # -- settings / emoji ---------------------------------------------------
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def get_emoji_full(self, key: str) -> Optional[tuple[str, str]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT emoji_id, fallback FROM emoji WHERE key = ?", (key,)).fetchone()
+            return (row["emoji_id"], row["fallback"]) if row else None
+
+    def set_emoji(self, key: str, emoji_id: str, fallback: str = "⭐") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO emoji (key, emoji_id, fallback) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET emoji_id = excluded.emoji_id, fallback = excluded.fallback",
+                (key, emoji_id, fallback),
+            )
+
+    def all_emoji_keys(self) -> list[sqlite3.Row]:
+        """Все слоты премиум-эмодзи (и дефолтные, и добавленные админом вручную) —
+        используется, чтобы админ-панель показывала ВСЕ доступные точки, а не 3."""
+        with self.connect() as conn:
+            return conn.execute("SELECT key, emoji_id, fallback FROM emoji ORDER BY key").fetchall()
+
+    # -- promo codes ----------------------------------------------------
+    def create_promo(self, code: str, days: int, max_activations: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO promo_codes (code, days, max_activations) VALUES (?, ?, ?)",
+                (code, days, max_activations),
+            )
+
+    def get_promo(self, code: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM promo_codes WHERE code = ?", (code,)).fetchone()
+
+    def list_promos(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM promo_codes ORDER BY created_at DESC").fetchall()
+
+    def delete_promo(self, code: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM promo_codes WHERE code = ?", (code,))
+            conn.execute("DELETE FROM promo_activations WHERE code = ?", (code,))
+
+    def has_activated_promo(self, code: str, user_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM promo_activations WHERE code = ? AND user_id = ?", (code, user_id)
+            ).fetchone()
+            return row is not None
+
+    def activate_promo(self, code: str, user_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("INSERT INTO promo_activations (code, user_id) VALUES (?, ?)", (code, user_id))
+            conn.execute(
+                "UPDATE promo_codes SET activations_count = activations_count + 1 WHERE code = ?", (code,)
+            )
+
+    def progress_summary_for_ai(self, user_id: int) -> str:
+        """Краткая сводка прогресса ученика — передаётся ИИ, чтобы он не спойлерил
+        уроки, до которых ученик ещё не дошёл."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT lang_key, course_key, lesson_index FROM progress WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        if not rows:
+            return "Ученик ещё не начал ни одного курса."
+        parts = [f"{r['lang_key']}/{r['course_key']}: открыто уроков {r['lesson_index']}" for r in rows]
+        return "Текущий прогресс ученика (не рассказывай про уроки дальше этого): " + "; ".join(parts)
+
+    def backup_to(self, dest_path: str) -> None:
+        with self.connect() as src:
+            dest = sqlite3.connect(dest_path)
+            try:
+                src.backup(dest)
+            finally:
+                dest.close()
+
+
+# ======================================================================
+# КНОПКИ / КЛАВИАТУРЫ (с поддержкой премиум-эмодзи из админки)
+# ======================================================================
+
+_EMOJI_TAG_RE = re.compile(r"\{emoji:(\w+)\}")
+
+
+def render_emoji_tags(db: Database, text: str) -> str:
+    """Заменяет {emoji:key} на <tg-emoji emoji-id="..."> с настроенным (или
+    дефолтным юникод-) эмодзи. Используется с parse_mode=HTML."""
+    def _sub(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        full = db.get_emoji_full(key)
+        if full and full[0]:
+            emoji_id, fallback = full
+            return f'<tg-emoji emoji-id="{escape(emoji_id)}">{escape(fallback)}</tg-emoji>'
+        return escape(TEXT_EMOJI_FALLBACKS.get(key, ""))
+    return _EMOJI_TAG_RE.sub(_sub, text)
+
+
+def _is_owner(user_id: int, settings: Settings) -> bool:
+    return user_id == settings.owner_id
+
+
+# ======================================================================
+# ИКОНКИ КНОПОК (обычный юникод-эмодзи перед текстом любой кнопки бота)
+# ======================================================================
+# ВАЖНО: премиум-эмодзи (custom_emoji entity) НЕЛЬЗЯ прикрепить к тексту
+# кнопки — у объекта кнопки в Bot API вообще нет поля под entities, это
+# железное ограничение Telegram, а не бота. Здесь можно менять только сам
+# юникод-символ перед текстом кнопки (любой обычный эмодзи на выбор).
+
+BUTTON_ICON_DEFAULTS: dict[str, tuple[str, str]] = {
+    "btn_courses": ("📚", "Курсы (главное меню)"),
+    "btn_reminders": ("⏰", "Напоминания (главное меню)"),
+    "btn_ai": ("🤖", "ИИ-помощник (главное меню)"),
+    "btn_profile": ("👤", "Профиль (главное меню)"),
+    "btn_terminal": ("💻", "Мини-терминал (главное меню)"),
+    "btn_top": ("🏆", "Топ (главное меню)"),
+    "btn_platform_guide": ("🛠", "«Как начать писать код»"),
+    "btn_ask_lesson": ("🤖", "«Спросить ИИ про этот урок»"),
+    "btn_lesson_list": ("📋", "«Список уроков»"),
+    "btn_next_course": ("🎉", "«Следующий курс»"),
+    "btn_all_done": ("🏆", "«Все курсы пройдены»"),
+    "btn_back_langs": ("⬅️", "«К списку языков»"),
+    "btn_back_courses": ("⬅️", "«К курсам»"),
+    "btn_pay_stars": ("⭐️", "«Купить за Stars»"),
+    "btn_pay_crypto": ("💎", "«Оплатить криптой»"),
+    "btn_promo_enter": ("🎁", "«У меня есть промокод»"),
+    "btn_reminder_set": ("🕗", "«Установить время» (напоминания)"),
+    "btn_reminder_off": ("🔕", "«Выключить напоминания»"),
+    "btn_daily_limit": ("⚙️", "«Уроков в день» (профиль)"),
+    "btn_buy_sub": ("⭐", "«Купить подписку» (профиль)"),
+    "btn_channel_sub": ("📢", "«Подписаться на канал»"),
+}
+BUTTON_ICON_DEFAULTS.update({
+    f"btn_lang_{key}": (lang["emoji_fallback"], f"Выбор языка: {lang['title']}")
+    for key, lang in LANGUAGES.items()
+})
+
+
+def get_button_visual(db: "Database", key: str) -> tuple[str, dict]:
+    """Возвращает (текстовый_префикс, kwargs) для кнопки: если админ установил
+    настоящий премиум-эмодзи (Bot API 9.4, icon_custom_emoji_id) — используем
+    его вместо юникод-символа. Плюс необязательный цвет (style: primary/
+    success/danger), тоже добавлен в Bot API 9.4."""
+    default_icon, _ = BUTTON_ICON_DEFAULTS.get(key, ("", ""))
+    full = db.get_emoji_full(f"btn:{key}")  # (emoji_id, fallback) | None
+    kwargs: dict = {}
+    if full and full[0]:
+        kwargs["icon_custom_emoji_id"] = full[0]
+        prefix = ""
+    else:
+        fallback = (full[1] if full and full[1] else default_icon)
+        prefix = f"{fallback} " if fallback else ""
+    style = db.get_setting(f"btnstyle:{key}", "")
+    if style in ("primary", "success", "danger"):
+        kwargs["style"] = style
+    return prefix, kwargs
+
+
+def get_button_icon(db: "Database", key: str) -> str:
+    """Обратная совместимость: просто текстовый префикс без учёта premium/style."""
+    prefix, _ = get_button_visual(db, key)
+    return prefix.strip()
+
+
+def mk_ikb(db: "Database", key: str, label: str, **extra) -> InlineKeyboardButton:
+    prefix, kwargs = get_button_visual(db, key)
+    custom_label = db.get_setting(f"btntext:{key}", "")
+    final_label = custom_label if custom_label else label
+    return InlineKeyboardButton(text=f"{prefix}{final_label}", **kwargs, **extra)
+
+
+def mk_kb(db: "Database", key: str, label: str) -> KeyboardButton:
+    prefix, kwargs = get_button_visual(db, key)
+    custom_label = db.get_setting(f"btntext:{key}", "")
+    final_label = custom_label if custom_label else label
+    return KeyboardButton(text=f"{prefix}{final_label}", **kwargs)
+
+
+def build_button_icons_admin_keyboard(db: Database) -> InlineKeyboardMarkup:
+    rows = []
+    for key, (default_icon, label) in BUTTON_ICON_DEFAULTS.items():
+        full = db.get_emoji_full(f"btn:{key}")
+        mark = "💎" if (full and full[0]) else (full[1] if full and full[1] else default_icon)
+        rows.append([InlineKeyboardButton(text=f"{mark} {label}", callback_data=f"admin_btnicon_pick:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_main_reply_keyboard(db: Database) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [mk_kb(db, "btn_courses", "Курсы"),
+             mk_kb(db, "btn_reminders", "Напоминания")],
+            [mk_kb(db, "btn_ai", "ИИ-помощник"),
+             mk_kb(db, "btn_profile", "Профиль")],
+            [mk_kb(db, "btn_terminal", "Мини-терминал"),
+             mk_kb(db, "btn_top", "Топ")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def build_terminal_lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐍 Python", callback_data="term_lang:python")],
+        [InlineKeyboardButton(text="🟨 JavaScript", callback_data="term_lang:javascript")],
+        [InlineKeyboardButton(text="🔵 C++", callback_data="term_lang:cpp")],
+    ])
+
+
+def build_language_keyboard(db: Database) -> InlineKeyboardMarkup:
+    rows = []
+    for key, lang in LANGUAGES.items():
+        rows.append([mk_ikb(db, f"btn_lang_{key}", lang["title"], callback_data=f"lang:{key}")])
+    rows.append([mk_ikb(db, "btn_platform_guide", "Как начать писать код", callback_data="platform_guide")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def course_is_unlocked(db: Database, settings: Settings, user_id: int, lang_key: str, course_key: str) -> bool:
+    idx_in_order = COURSE_ORDER.index(course_key)
+    if idx_in_order > 0:
+        prev_key = COURSE_ORDER[idx_in_order - 1]
+        prev_total = len(get_course(lang_key, prev_key)["lessons"])
+        prev_row = db.get_progress_row(user_id, lang_key, prev_key)
+        if not (prev_row and prev_row["lesson_index"] >= prev_total):
+            return False
+    sub_required = db.get_setting("subscription_required", "0") == "1"
+    # strict_mode = "1" -> подписка нужна на ВСЕ курсы, включая первый (раньше первый
+    # курс всегда был бесплатным "пробником" — если ты видел доступ со второго
+    # аккаунта без оплаты именно на первом курсе, дело было в этом: это был не баг,
+    # а расчитанный бесплатный пробный курс. Включи strict_mode, если хочешь закрыть и его.
+    strict_mode = db.get_setting("subscription_strict", "0") == "1"
+    gate_this_course = sub_required and (idx_in_order > 0 or strict_mode)
+    if gate_this_course:
+        return db.is_subscribed(user_id, settings.owner_id)
+    return True
+
+
+def build_course_list_keyboard(db: Database, settings: Settings, user_id: int, lang_key: str) -> InlineKeyboardMarkup:
+    lang = LANGUAGES[lang_key]
+    rows = []
+    for course_key in COURSE_ORDER:
+        course = lang["courses"][course_key]
+        total = len(course["lessons"])
+        row = db.get_progress_row(user_id, lang_key, course_key)
+        done = row["lesson_index"] if row else 0
+        if not course_is_unlocked(db, settings, user_id, lang_key, course_key):
+            prefix = "🔒 "
+        elif done >= total:
+            prefix = "✅ "
+        else:
+            prefix = "▶️ "
+        rows.append([InlineKeyboardButton(
+            text=f"{prefix}{course['title']} ({min(done, total)}/{total})",
+            callback_data=f"course:{lang_key}:{course_key}",
+        )])
+    rows.append([mk_ikb(db, "btn_back_langs", "К списку языков", callback_data="courses_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lesson_access(row: Optional[sqlite3.Row], idx: int) -> str:
+    """Возвращает 'open' (можно открыть), 'done' (уже открывался раньше),
+    'wait' (появится через сутки) или 'locked' (ещё далеко)."""
+    lesson_index = row["lesson_index"] if row else 0
+    if idx == 0:
+        return "done" if lesson_index > 0 else "open"
+    if idx < lesson_index:
+        return "done"
+    if idx == lesson_index:
+        unlocked_at = row["unlocked_at"] if row else int(time.time())
+        if int(time.time()) >= unlocked_at + DAILY_UNLOCK_HOURS * 3600:
+            return "open"
+        return "wait"
+    return "locked"
+
+
+def build_lesson_list_keyboard(db: Database, user_id: int, lang_key: str, course_key: str) -> InlineKeyboardMarkup:
+    course = get_course(lang_key, course_key)
+    row = db.get_progress_row(user_id, lang_key, course_key)
+    unlimited = db.get_setting("unlimited_lessons", "0") == "1"
+    rows = []
+    for i, lesson in enumerate(course["lessons"]):
+        state = "open" if unlimited else lesson_access(row, i)
+        prefix = {"open": "▶️ ", "done": "✅ ", "wait": "⏳ ", "locked": "🔒 "}[state]
+        rows.append([InlineKeyboardButton(text=f"{prefix}{lesson['title']}", callback_data=f"lesson:{lang_key}:{course_key}:{i}")])
+    rows.append([mk_ikb(db, "btn_back_courses", "К курсам", callback_data=f"lang:{lang_key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_lesson_nav_keyboard(db: Database, lang_key: str, course_key: str, idx: int, is_last_in_course: bool) -> InlineKeyboardMarkup:
+    rows = [[mk_ikb(db, "btn_ask_lesson", "Спросить ИИ про этот урок", callback_data=f"ask_lesson:{lang_key}:{course_key}:{idx}")]]
+    if not is_last_in_course:
+        rows.append([mk_ikb(db, "btn_lesson_list", "Список уроков", callback_data=f"course:{lang_key}:{course_key}")])
+    else:
+        nxt = next_course_key(course_key)
+        if nxt:
+            rows.append([mk_ikb(db, "btn_next_course", "Курс пройден! Следующий курс →", callback_data=f"course:{lang_key}:{nxt}")])
+        else:
+            rows.append([mk_ikb(db, "btn_all_done", "Все курсы этого языка пройдены!", callback_data=f"lang:{lang_key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_buy_sub_keyboard(db: Database) -> InlineKeyboardMarkup:
+    price = db.get_setting("price_stars", "150")
+    price_usd = db.get_setting("price_usd", "5")
+    rows = []
+    if db.get_setting("stars_enabled", "1") == "1":
+        rows.append([mk_ikb(db, "btn_pay_stars", f"Купить за {price} Stars", callback_data="pay_stars")])
+    if db.get_setting("crypto_pay_token", ""):
+        rows.append([mk_ikb(db, "btn_pay_crypto", f"Оплатить криптой (${price_usd})", callback_data="pay_crypto")])
+    rows.append([mk_ikb(db, "btn_promo_enter", "У меня есть промокод", callback_data="activate_promo_btn")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_reminder_keyboard(db: Database, enabled: bool) -> InlineKeyboardMarkup:
+    rows = [[mk_ikb(db, "btn_reminder_set", "Установить время", callback_data="set_reminder_time")]]
+    if enabled:
+        rows.append([mk_ikb(db, "btn_reminder_off", "Выключить напоминания", callback_data="reminder_off")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_daily_limit_keyboard(db: Database, user_id: int) -> InlineKeyboardMarkup:
+    current, _ = db.daily_limit_status(user_id)
+    rows, row = [], []
+    for choice in Database.DAILY_LIMIT_CHOICES:
+        label = "♾ Без лимита" if choice == 0 else f"{choice}"
+        if choice == current:
+            label = f"✅ {label}"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"set_daily_limit:{choice}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_admin_menu_keyboard(db: Database) -> InlineKeyboardMarkup:
+    sub_required = db.get_setting("subscription_required", "0") == "1"
+    strict = db.get_setting("subscription_strict", "0") == "1"
+    crypto_set = bool(db.get_setting("crypto_pay_token", ""))
+    stars_on = db.get_setting("stars_enabled", "1") == "1"
+    unlimited = db.get_setting("unlimited_lessons", "0") == "1"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promo")],
+            [InlineKeyboardButton(
+                text=f"🔐 Подписка: {'ВКЛ' if sub_required else 'выкл (всё бесплатно)'}",
+                callback_data="admin_sub_toggle",
+            )],
+            [InlineKeyboardButton(
+                text=f"🔒 Первый курс тоже платный: {'ДА' if strict else 'нет (пробный бесплатный)'}",
+                callback_data="admin_sub_strict_toggle",
+            )],
+            [InlineKeyboardButton(
+                text=f"♾️ Уроки без ограничений: {'ДА' if unlimited else 'нет (1 в день + лимит)'}",
+                callback_data="admin_unlimited_toggle",
+            )],
+            [InlineKeyboardButton(
+                text=f"⭐ Оплата Stars: {'ВКЛ' if stars_on else 'ВЫКЛ'}",
+                callback_data="admin_stars_toggle",
+            )],
+            [InlineKeyboardButton(text=f"⭐ Цена подписки (Stars): {db.get_setting('price_stars', '150')}", callback_data="admin_stars_price")],
+            [InlineKeyboardButton(
+                text=f"💰 CryptoBot API-ключ: {'настроен ✅' if crypto_set else 'не задан'}",
+                callback_data="admin_crypto_token",
+            )],
+            [InlineKeyboardButton(text=f"💵 Цена подписки (USD): {db.get_setting('price_usd', '5')}", callback_data="admin_crypto_price")],
+            [InlineKeyboardButton(text=f"🧠 Модель ИИ: {db.get_setting('ai_model_override', '') or 'по умолчанию'}", callback_data="admin_ai_model")],
+            [InlineKeyboardButton(text="💎 Премиум-эмодзи (в текстах)", callback_data="admin_emoji")],
+            [InlineKeyboardButton(text="🔘 Иконки, цвет и текст кнопок", callback_data="admin_btnicons")],
+            [InlineKeyboardButton(
+                text=f"📢 Канал: {db.get_setting('channel_username', '') or 'не задан'}",
+                callback_data="admin_channel",
+            )],
+            [InlineKeyboardButton(text="💾 Скачать бэкап БД", callback_data="admin_backup")],
+        ]
+    )
+
+
+def build_admin_promo_keyboard(db: Database) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать промокод", callback_data="admin_promo_create")],
+            [InlineKeyboardButton(text="📋 Список промокодов", callback_data="admin_promo_list")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu")],
+        ]
+    )
+
+
+def build_promo_list_keyboard(promos: list) -> InlineKeyboardMarkup:
+    rows = []
+    for p in promos:
+        label = f"{p['code']} · {p['activations_count']}/{p['max_activations']} · {p['days']}дн."
+        if not p["active"]:
+            label = "🚫 " + label
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_promo_del:{p['code']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_promo")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_emoji_admin_keyboard(db: Database) -> InlineKeyboardMarkup:
+    """Универсальная клавиатура: показывает ВСЕ существующие слоты эмодзи из БД
+    (не только 3 дефолтных), плюс кнопку добавить свой слот на любую кнопку/текст."""
+    rows = []
+    for row in db.all_emoji_keys():
+        key = row["key"]
+        label = TEXT_EMOJI_LABELS.get(key, key)
+        current = row["fallback"] or "⭐"
+        rows.append([InlineKeyboardButton(text=f"{current} {label}", callback_data=f"admin_emoji_pick:{key}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить свой (любой текст/кнопка)", callback_data="admin_emoji_new")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ======================================================================
+# FSM STATES
+# ======================================================================
+
+
+class UserStates(StatesGroup):
+    waiting_reminder_time = State()
+    waiting_promo_code = State()
+    waiting_ai_question = State()
+    waiting_ai_lesson_question = State()
+    waiting_terminal_code = State()
+
+
+class AdminStates(StatesGroup):
+    waiting_broadcast_text = State()
+    waiting_promo_code_name = State()
+    waiting_promo_days = State()
+    waiting_promo_max = State()
+    waiting_emoji_forward = State()
+    waiting_new_emoji_key = State()
+    waiting_crypto_token = State()
+    waiting_crypto_price = State()
+    waiting_button_icon = State()
+    waiting_channel_username = State()
+    waiting_stars_price = State()
+    waiting_ai_model = State()
+
+
+# ======================================================================
+# ХЕЛПЕРЫ ДОСТУПА К УРОКАМ
+# ======================================================================
+
+
+# ======================================================================
+# «КАК НАЧАТЬ ПИСАТЬ КОД» — гид по платформам/устройствам
+# ======================================================================
+
+
+def build_platform_device_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Без установки (прямо в боте)", callback_data="platform_webapp")],
+        [InlineKeyboardButton(text="📱 У меня телефон", callback_data="platform_device:phone")],
+        [InlineKeyboardButton(text="💻 У меня компьютер", callback_data="platform_device:pc")],
+    ])
+
+
+def build_phone_os_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Android", callback_data="platform_phone:android")],
+        [InlineKeyboardButton(text="🍎 iPhone / iPad", callback_data="platform_phone:ios")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="platform_guide")],
+    ])
+
+
+def build_pc_os_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🪟 Windows", callback_data="platform_pc:windows")],
+        [InlineKeyboardButton(text="🍎 macOS", callback_data="platform_pc:mac")],
+        [InlineKeyboardButton(text="🐧 Linux", callback_data="platform_pc:linux")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="platform_guide")],
+    ])
+
+
+PLATFORM_PHONE_TEXT = {
+    "android": (
+        "📱 <b>Android — как писать код</b>\n\n"
+        "Самый простой путь — <b>Pydroid 3</b> (для Python) из Google Play: полноценный "
+        "офлайн-интерпретатор Python, ничего дополнительно ставить не нужно.\n\n"
+        "Для JavaScript/C++ на Android удобен <b>Termux</b> (терминал с Linux-окружением, "
+        "тоже из Google Play или F-Droid) — после установки: <code>pkg install nodejs</code> "
+        "или <code>pkg install clang</code>.\n\n"
+        "Но проще всего — просто открой встроенный терминал прямо в этом боте, без "
+        "установки чего-либо (кнопка «💻 Открыть терминал» под каждым уроком)."
+    ),
+    "ios": (
+        "🍎 <b>iPhone/iPad — как писать код</b>\n\n"
+        "У Apple строгие ограничения на выполнение кода в приложениях, поэтому выбор "
+        "меньше и многие хорошие приложения платные (например Pythonista для Python).\n\n"
+        "Самый простой и бесплатный вариант на iOS — <b>встроенный терминал прямо в этом "
+        "боте</b> (кнопка «💻 Открыть терминал» под каждым уроком), он открывается в браузере "
+        "внутри Telegram и работает без всякой установки."
+    ),
+}
+
+PLATFORM_PC_TEXT = {
+    "windows": (
+        "🪟 <b>Windows — как писать код</b>\n\n"
+        "🐍 <b>Python</b>: скачай с официального сайта — python.org/downloads (жми большую "
+        "жёлтую кнопку Download). При установке обязательно отметь галочку «Add Python to PATH».\n\n"
+        "📜 <b>JavaScript (Node.js)</b>: nodejs.org — скачай версию LTS.\n\n"
+        "⚙️ <b>C++</b>: проще всего — <b>Code::Blocks</b> (codeblocks.org/downloads) — там сразу "
+        "идёт компилятор в комплекте, ничего доустанавливать не нужно.\n\n"
+        "Для любого языка также подойдёт <b>Visual Studio Code</b> (code.visualstudio.com) "
+        "с соответствующим расширением."
+    ),
+    "mac": (
+        "🍎 <b>macOS — как писать код</b>\n\n"
+        "🐍 <b>Python</b>: python.org/downloads, либо через терминал: <code>brew install python</code> "
+        "(если установлен Homebrew).\n\n"
+        "📜 <b>JavaScript (Node.js)</b>: nodejs.org, либо <code>brew install node</code>.\n\n"
+        "⚙️ <b>C++</b>: открой Терминал и выполни <code>xcode-select --install</code> — поставится "
+        "компилятор clang от Apple, больше ничего не нужно.\n\n"
+        "Для редактирования кода отлично подходит <b>Visual Studio Code</b> (code.visualstudio.com)."
+    ),
+    "linux": (
+        "🐧 <b>Linux — как писать код</b>\n\n"
+        "Скорее всего Python уже установлен (проверь: <code>python3 --version</code>).\n\n"
+        "📜 <b>JavaScript</b>: <code>sudo apt install nodejs npm</code> (Ubuntu/Debian) или аналог "
+        "для твоего дистрибутива.\n\n"
+        "⚙️ <b>C++</b>: <code>sudo apt install build-essential</code> — поставит компилятор g++.\n\n"
+        "Редактор — <b>Visual Studio Code</b> (code.visualstudio.com) или любой на твой вкус."
+    ),
+}
+
+
+# ======================================================================
+# ТЕКСТЫ
+# ======================================================================
+
+
+def welcome_text(db: Database) -> str:
+    return render_emoji_tags(db, (
+        "{emoji:welcome_icon} <b>Добро пожаловать в CodeSchool!</b>\n\n"
+        "Здесь ты изучишь <b>Python</b>, <b>JavaScript</b> и <b>C++</b> — с уроками, "
+        "практическими заданиями, ежедневными напоминаниями и ИИ-помощником, который ответит на "
+        "любой вопрос по курсу.\n\n"
+        "Жми «📚 Курсы» внизу, выбирай язык — и начинай учиться 👇"
+    ))
+
+
+def profile_text(db: Database, settings: Settings, user_id: int, row: sqlite3.Row) -> str:
+    lines = []
+    for lang_key, lang in LANGUAGES.items():
+        total_all = sum(len(c["lessons"]) for c in lang["courses"].values())
+        done_all = 0
+        for course_key, course in lang["courses"].items():
+            prow = db.get_progress_row(user_id, lang_key, course_key)
+            done_all += min(prow["lesson_index"], len(course["lessons"])) if prow else 0
+        lines.append(f"{lang['emoji_fallback']} {lang['title']}: {done_all}/{total_all} уроков")
+    if user_id == settings.owner_id:
+        sub_line = "безлимит (владелец)"
+    elif row["sub_until"] and row["sub_until"] > int(time.time()):
+        sub_line = datetime.fromtimestamp(row["sub_until"]).strftime("активна до %d.%m.%Y")
+    else:
+        sub_line = "не активна"
+    reminder = f"{row['reminder_time']} (вкл)" if row["reminder_enabled"] else "выключены"
+    rank, points = db.user_rank(user_id)
+    rank_line = f"🏆 Очки: {points} (место в топе: {rank})" if points else "🏆 Очки: 0 — пройди первый урок!"
+    limit, done_today = db.daily_limit_status(user_id)
+    limit_line = f"{done_today}/{limit if limit else '∞'} новых уроков сегодня"
+    return (
+        "👤 <b>Профиль</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\n{rank_line}\n🔐 Подписка: {sub_line}\n⏰ Напоминания: {reminder}\n📅 Лимит: {limit_line}"
+    )
+
+
+def leaderboard_text(db: Database) -> str:
+    top = db.top_users(10)
+    if not top:
+        return "🏆 <b>Топ пользователей</b>\n\nПока никто не набрал очков — стань первым!"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, row in enumerate(top):
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        name = escape(row["first_name"] or row["username"] or "Пользователь")
+        lines.append(f"{medal} {name} — {row['points']} очков")
+    return "🏆 <b>Топ пользователей</b>\n\n" + "\n".join(lines)
+
+
+# ======================================================================
+# HANDLERS
+# ======================================================================
+
+
+def register_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
+
+    def _btn_filter(key: str, default_label: str):
+        def _check(message: Message) -> bool:
+            text = message.text or ""
+            custom = db.get_setting(f"btntext:{key}", "")
+            label = custom if custom else default_label
+            return text.endswith(label)
+        return _check
+
+    async def show_lesson(bot: Bot, chat_id: int, lang_key: str, course_key: str, idx: int, user_id: int) -> None:
+        lesson = get_lesson(lang_key, course_key, idx)
+        course = get_course(lang_key, course_key)
+        if not lesson or not course:
+            await bot.send_message(chat_id, "Урок не найден.")
+            return
+        if not course_is_unlocked(db, settings, user_id, lang_key, course_key):
+            await bot.send_message(chat_id, "🔒 Этот курс доступен по подписке.", reply_markup=build_buy_sub_keyboard(db))
+            return
+        db.start_course(user_id, lang_key, course_key)
+        row = db.get_progress_row(user_id, lang_key, course_key)
+        unlimited = db.get_setting("unlimited_lessons", "0") == "1"
+        state = "open" if unlimited else lesson_access(row, idx)
+        if state in ("wait", "locked"):
+            hours_left = 0.0
+            if state == "wait" and row:
+                hours_left = max(0.0, row["unlocked_at"] + DAILY_UNLOCK_HOURS * 3600 - time.time()) / 3600
+            msg = (
+                f"⏳ Следующий урок откроется через ~{hours_left:.1f} ч. Один урок в день — так материал "
+                f"лучше усваивается! Загляни завтра 🙂"
+                if state == "wait" else
+                "🔒 До этого урока ещё рано — сначала пройди предыдущие."
+            )
+            await bot.send_message(chat_id, msg)
+            return
+        is_new = idx >= (row["lesson_index"] if row else 0)
+        if is_new and not unlimited and not db.try_consume_daily_lesson(user_id):
+            limit, _ = db.daily_limit_status(user_id)
+            await bot.send_message(
+                chat_id,
+                f"🎯 Ты прошёл максимум новых уроков на сегодня ({limit}/день). "
+                "Возвращайся завтра — или измени лимит в «👤 Профиль» → «⚙️ Уроков в день».",
+                reply_markup=build_daily_limit_keyboard(db, user_id),
+            )
+            return
+        db.advance_progress(user_id, lang_key, course_key, idx + 1)
+        if is_new:
+            db.add_points(user_id, POINTS_PER_LESSON)
+        lang = LANGUAGES[lang_key]
+        body = _markdown_to_telegram_html(lesson["content"])
+        task = escape(lesson["task"])
+        points_line = f"\n\n+{POINTS_PER_LESSON} 🏆 очков!" if is_new else ""
+        text = (
+            f"<b>{escape(lesson['title'])}</b> · {lang['title']} · {course['title']}\n\n"
+            f"{body}\n\n📝 <b>Задание:</b> {task}{points_line}"
+        )
+        is_last = idx == len(course["lessons"]) - 1
+        await bot.send_message(
+            chat_id, text, parse_mode="HTML",
+            reply_markup=build_lesson_nav_keyboard(db, lang_key, course_key, idx, is_last),
+        )
+        if settings.webapp_url:
+            await bot.send_message(
+                chat_id, "Можешь сразу попробовать написать и запустить код в терминале 👇",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="💻 Открыть терминал",
+                        web_app=WebAppInfo(url=f"{settings.webapp_url}?lang={lang['piston_lang']}"),
+                    )
+                ]]),
+            )
+
+    # -- /start и главное меню -------------------------------------------
+    @dp.message(Command("start"))
+    async def handle_start(message: Message) -> None:
+        user_id = message.from_user.id
+        db.upsert_user(user_id, message.from_user.first_name or "", message.from_user.username)
+        await message.answer(
+            welcome_text(db), parse_mode="HTML", reply_markup=build_main_reply_keyboard(db)
+        )
+        channel = db.get_setting("channel_username", "")
+        if channel:
+            await message.answer(
+                "Подпишись на наш канал — там анонсы новых курсов и фишки по коду:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [mk_ikb(db, "btn_channel_sub", "Подписаться на канал", url=f"https://t.me/{channel.lstrip('@')}")]
+                ]),
+            )
+
+    @dp.message(_btn_filter("btn_courses", "Курсы"))
+    async def handle_courses_btn(message: Message) -> None:
+        await message.answer("Выбери язык программирования:", reply_markup=build_language_keyboard(db))
+
+    @dp.message(Command("help"))
+    async def handle_help_cmd(message: Message) -> None:
+        await message.answer(
+            "ℹ️ <b>CodeSchool</b> — бот для бесплатного изучения программирования "
+            "(Python, JavaScript, C++).\n\n"
+            "Что тут есть:\n"
+            "📚 <b>Курсы</b> — пошаговые уроки с практическими заданиями\n"
+            "🤖 <b>ИИ-помощник</b> — вопросы по коду и по урокам\n"
+            "⏰ <b>Напоминания</b> — бот напомнит позаниматься\n"
+            "👤 <b>Профиль</b> — прогресс, очки, лимит уроков в день\n"
+            "🏆 <b>Топ</b> — рейтинг учеников\n\n"
+            "Команды: /start — перезапустить, /promo — активировать промокод, /top — рейтинг.",
+            parse_mode="HTML",
+        )
+
+    @dp.message(Command("top"))
+    async def handle_top_cmd(message: Message) -> None:
+        await message.answer(leaderboard_text(db), parse_mode="HTML")
+
+    @dp.message(_btn_filter("btn_top", "Топ"))
+    async def handle_top_btn(message: Message) -> None:
+        await message.answer(leaderboard_text(db), parse_mode="HTML")
+
+    # -- «Как начать писать код» (гид по устройствам/ОС) -------------------
+    @dp.callback_query(F.data == "platform_guide")
+    async def handle_platform_guide(callback: CallbackQuery) -> None:
+        text = "🛠 <b>Как начать писать код?</b>\n\nВыбери, что тебе удобнее:"
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=build_platform_device_keyboard())
+        except TelegramBadRequest:
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=build_platform_device_keyboard())
+        await callback.answer()
+
+    @dp.callback_query(F.data == "platform_webapp")
+    async def handle_platform_webapp(callback: CallbackQuery) -> None:
+        if not settings.webapp_url:
+            await callback.answer("Встроенный терминал пока не настроен владельцем бота.", show_alert=True)
+            return
+        await callback.message.answer(
+            "⚡ Ничего устанавливать не нужно — просто открой терминал и пиши код прямо здесь:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="💻 Открыть терминал", web_app=WebAppInfo(url=settings.webapp_url))
+            ]]),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("platform_device:"))
+    async def handle_platform_device(callback: CallbackQuery) -> None:
+        device = callback.data.split(":", 1)[1]
+        if device == "phone":
+            await callback.message.edit_text("📱 Какой у тебя телефон?", reply_markup=build_phone_os_keyboard())
+        else:
+            await callback.message.edit_text("💻 Какая у тебя операционная система?", reply_markup=build_pc_os_keyboard())
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("platform_phone:"))
+    async def handle_platform_phone(callback: CallbackQuery) -> None:
+        os_key = callback.data.split(":", 1)[1]
+        await callback.message.edit_text(
+            PLATFORM_PHONE_TEXT[os_key], parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="platform_guide")]]),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("platform_pc:"))
+    async def handle_platform_pc(callback: CallbackQuery) -> None:
+        os_key = callback.data.split(":", 1)[1]
+        await callback.message.edit_text(
+            PLATFORM_PC_TEXT[os_key], parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="platform_guide")]]),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data == "courses_menu")
+    async def handle_courses_menu(callback: CallbackQuery) -> None:
+        await callback.message.edit_text("Выбери язык программирования:", reply_markup=build_language_keyboard(db))
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("lang:"))
+    async def handle_lang_open(callback: CallbackQuery) -> None:
+        lang_key = callback.data.split(":", 1)[1]
+        user_id = callback.from_user.id
+        text = f"<b>{LANGUAGES[lang_key]['title']}</b> — выбери курс:"
+        markup = build_course_list_keyboard(db, settings, user_id, lang_key)
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest:
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=markup)
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("course:"))
+    async def handle_course_open(callback: CallbackQuery) -> None:
+        _, lang_key, course_key = callback.data.split(":", 2)
+        user_id = callback.from_user.id
+        if not course_is_unlocked(db, settings, user_id, lang_key, course_key):
+            await callback.answer()
+            idx_in_order = COURSE_ORDER.index(course_key)
+            prev_course_done = True
+            if idx_in_order > 0:
+                prev_key = COURSE_ORDER[idx_in_order - 1]
+                prev_total = len(get_course(lang_key, prev_key)["lessons"])
+                prev_row = db.get_progress_row(user_id, lang_key, prev_key)
+                prev_course_done = bool(prev_row and prev_row["lesson_index"] >= prev_total)
+            if not prev_course_done:
+                await callback.message.answer("🔒 Сначала пройди предыдущий курс до конца.")
+            else:
+                await callback.message.answer(
+                    "🔒 Этот курс доступен по подписке.", reply_markup=build_buy_sub_keyboard(db)
+                )
+            return
+        db.start_course(user_id, lang_key, course_key)
+        course = get_course(lang_key, course_key)
+        text = f"<b>{LANGUAGES[lang_key]['title']} · {course['title']}</b> — выбери урок:"
+        markup = build_lesson_list_keyboard(db, user_id, lang_key, course_key)
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest:
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=markup)
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("lesson:"))
+    async def handle_lesson_open(callback: CallbackQuery) -> None:
+        _, lang_key, course_key, idx_s = callback.data.split(":", 3)
+        await show_lesson(callback.bot, callback.message.chat.id, lang_key, course_key, int(idx_s), callback.from_user.id)
+        await callback.answer()
+
+    # -- ИИ-помощник (по уроку и общий) ----------------------------------
+    @dp.callback_query(F.data.startswith("ask_lesson:"))
+    async def handle_ask_lesson(callback: CallbackQuery, state: FSMContext) -> None:
+        _, lang_key, course_key, idx_s = callback.data.split(":", 3)
+        await state.set_state(UserStates.waiting_ai_lesson_question)
+        await state.update_data(ai_lang=lang_key, ai_course=course_key, ai_idx=int(idx_s))
+        await callback.message.answer("Задай вопрос по этому уроку — отвечу как можно понятнее.")
+        await callback.answer()
+
+    @dp.message(UserStates.waiting_ai_lesson_question)
+    async def handle_ai_lesson_question(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        await state.clear()
+        lesson = get_lesson(data.get("ai_lang", ""), data.get("ai_course", ""), data.get("ai_idx", 0))
+        context = f"Тема урока: {lesson['title']}\n{lesson['content']}\n\n" if lesson else ""
+        icon = render_emoji_tags(db, "{emoji:ai_icon}")
+        thinking = await message.answer(f"{icon} Думаю...", parse_mode="HTML")
+        answer = await _ai_chat_completion(settings, context + "Вопрос ученика: " + (message.text or ""), db=db)
+        body = _markdown_to_telegram_html(answer) if answer else "⚠️ Не получилось получить ответ, попробуй ещё раз."
+        try:
+            await thinking.edit_text(f"{icon} {body}", parse_mode="HTML")
+        except Exception:
+            await message.answer(f"{icon} {body}", parse_mode="HTML")
+
+    @dp.message(_btn_filter("btn_ai", "ИИ-помощник"))
+    async def handle_ai_helper_btn(message: Message, state: FSMContext) -> None:
+        await state.set_state(UserStates.waiting_ai_question)
+        await message.answer("Задай любой вопрос по Python / JavaScript / C++ — отвечу и приведу пример кода.")
+
+    @dp.message(UserStates.waiting_ai_question)
+    async def handle_ai_question(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        icon = render_emoji_tags(db, "{emoji:ai_icon}")
+        thinking = await message.answer(f"{icon} Думаю...", parse_mode="HTML")
+        progress_note = db.progress_summary_for_ai(message.from_user.id)
+        prompt = (f"{progress_note}\n\nВопрос ученика: " if progress_note else "") + (message.text or "")
+        answer = await _ai_chat_completion(settings, prompt, db=db)
+        body = _markdown_to_telegram_html(answer) if answer else "⚠️ Не получилось получить ответ, попробуй ещё раз."
+        try:
+            await thinking.edit_text(f"{icon} {body}", parse_mode="HTML")
+        except Exception:
+            await message.answer(f"{icon} {body}", parse_mode="HTML")
+
+    # -- Мини-терминал (прямо в чате, без WebApp) --------------------------
+    @dp.message(_btn_filter("btn_terminal", "Мини-терминал"))
+    async def handle_terminal_btn(message: Message) -> None:
+        await message.answer(
+            "Выбери язык, на котором будешь писать код:",
+            reply_markup=build_terminal_lang_keyboard(),
+        )
+
+    @dp.callback_query(F.data.startswith("term_lang:"))
+    async def handle_term_lang_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        lang = callback.data.split(":", 1)[1]
+        await state.set_state(UserStates.waiting_terminal_code)
+        await state.update_data(term_lang=lang)
+        await callback.message.answer(
+            f"Ок, язык — {lang}. Пришли код одним сообщением — я покажу, что примерно выведет "
+            "терминал, и объясню, почему именно так (без реального запуска, просто разбор кода)."
+        )
+        await callback.answer()
+
+    @dp.message(UserStates.waiting_terminal_code)
+    async def handle_terminal_code(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        lang = data.get("term_lang", "python")
+        code = message.text or ""
+        icon = render_emoji_tags(db, "{emoji:terminal_icon}")
+        thinking = await message.answer(f"{icon} Разбираю код...", parse_mode="HTML")
+        prompt = (
+            f"Ученик написал код на {lang}. Покажи, ЧТО ИМЕННО выведет терминал построчно (или укажи "
+            f"ошибку, если код некорректен), затем коротко объясни логику выполнения по шагам. "
+            f"Не выполняй код на самом деле — просто проанализируй его как эксперт-разработчик:\n\n"
+            f"```{lang}\n{code}\n```"
+        )
+        answer = await _ai_chat_completion(settings, prompt, db=db)
+        body = _markdown_to_telegram_html(answer) if answer else "⚠️ Не получилось разобрать код, попробуй ещё раз."
+        try:
+            await thinking.edit_text(f"{icon} {body}", parse_mode="HTML")
+        except Exception:
+            await message.answer(f"{icon} {body}", parse_mode="HTML")
+        await state.set_state(UserStates.waiting_terminal_code)  # можно сразу прислать следующий код
+        await state.update_data(term_lang=lang)
+
+    # -- Профиль -----------------------------------------------------------
+    @dp.message(_btn_filter("btn_profile", "Профиль"))
+    async def handle_profile_btn(message: Message) -> None:
+        user_id = message.from_user.id
+        db.upsert_user(user_id, message.from_user.first_name or "", message.from_user.username)
+        row = db.get_user(user_id)
+        rows = [[mk_ikb(db, "btn_daily_limit", "Уроков в день", callback_data="daily_limit_menu")]]
+        if db.get_setting("subscription_required", "0") == "1" and not db.is_subscribed(user_id, settings.owner_id):
+            rows.append([mk_ikb(db, "btn_buy_sub", "Купить подписку", callback_data="buy_sub")])
+        await message.answer(
+            profile_text(db, settings, user_id, row), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    @dp.callback_query(F.data == "daily_limit_menu")
+    async def handle_daily_limit_menu(callback: CallbackQuery) -> None:
+        await callback.message.answer(
+            "📅 Сколько НОВЫХ уроков максимум можно проходить в день?\n"
+            "Так материал усваивается лучше — но лимит только твой, меняй как удобно.",
+            reply_markup=build_daily_limit_keyboard(db, callback.from_user.id),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("set_daily_limit:"))
+    async def handle_set_daily_limit(callback: CallbackQuery) -> None:
+        choice = int(callback.data.split(":", 1)[1])
+        db.set_daily_lesson_limit(callback.from_user.id, choice)
+        label = "без лимита" if choice == 0 else f"{choice} в день"
+        await callback.answer(f"Готово: {label} ✅", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=build_daily_limit_keyboard(db, callback.from_user.id))
+        except TelegramBadRequest:
+            pass
+
+    # -- Напоминания ---------------------------------------------------
+    @dp.message(_btn_filter("btn_reminders", "Напоминания"))
+    async def handle_reminders_btn(message: Message) -> None:
+        row = db.get_user(message.from_user.id)
+        enabled = bool(row and row["reminder_enabled"])
+        current = f"\n\nСейчас: {row['reminder_time']}" if enabled else ""
+        await message.answer(
+            "Ежедневное напоминание позанимался ли ты сегодня 📖" + current,
+            reply_markup=build_reminder_keyboard(db, enabled),
+        )
+
+    @dp.callback_query(F.data == "set_reminder_time")
+    async def handle_set_reminder_time(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(UserStates.waiting_reminder_time)
+        await callback.message.answer("Во сколько напоминать? Напиши время в формате ЧЧ:ММ, например 19:00")
+        await callback.answer()
+
+    @dp.message(UserStates.waiting_reminder_time)
+    async def handle_reminder_time_input(message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", raw):
+            await message.answer("Формат должен быть ЧЧ:ММ, например 08:30. Попробуй ещё раз:")
+            return
+        await state.clear()
+        db.set_reminder(message.from_user.id, raw, True)
+        await message.answer(f"✅ Буду напоминать каждый день в {raw}.")
+
+    @dp.callback_query(F.data == "reminder_off")
+    async def handle_reminder_off(callback: CallbackQuery) -> None:
+        db.set_reminder(callback.from_user.id, None, False)
+        await callback.message.edit_text("🔕 Напоминания выключены.")
+        await callback.answer()
+
+    # -- Подписка / промокоды ---------------------------------------------
+    def _activate_promo(user_id: int, code: str) -> str:
+        code = code.strip().upper()
+        if not code:
+            return "Введите код промокода."
+        row = db.get_promo(code)
+        if not row or not row["active"]:
+            return "🚫 Такого промокода не существует или он деактивирован."
+        if row["activations_count"] >= row["max_activations"]:
+            return "🚫 У промокода закончился лимит активаций."
+        if db.has_activated_promo(code, user_id):
+            return "Вы уже активировали этот промокод."
+        db.activate_promo(code, user_id)
+        new_until = db.grant_subscription(user_id, row["days"])
+        until_str = datetime.fromtimestamp(new_until).strftime("%d.%m.%Y")
+        return f"🎁 Промокод активирован! Подписка активна до <b>{until_str}</b>."
+
+    @dp.message(Command("promo"))
+    async def handle_promo_cmd(message: Message, command: CommandObject) -> None:
+        code = (command.args or "").strip()
+        if not code:
+            await message.answer("Использование: <code>/promo КОД</code>", parse_mode="HTML")
+            return
+        await message.answer(_activate_promo(message.from_user.id, code), parse_mode="HTML")
+
+    @dp.callback_query(F.data == "activate_promo_btn")
+    async def handle_activate_promo_btn(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(UserStates.waiting_promo_code)
+        await callback.message.answer("Введи код промокода:")
+        await callback.answer()
+
+    @dp.message(UserStates.waiting_promo_code)
+    async def handle_promo_code_input(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(_activate_promo(message.from_user.id, message.text or ""), parse_mode="HTML")
+
+    @dp.callback_query(F.data == "buy_sub")
+    async def handle_buy_sub(callback: CallbackQuery) -> None:
+        await callback.message.answer("Оформить доступ ко всем урокам:", reply_markup=build_buy_sub_keyboard(db))
+        await callback.answer()
+
+    @dp.callback_query(F.data == "pay_stars")
+    async def handle_pay_stars(callback: CallbackQuery) -> None:
+        if db.get_setting("stars_enabled", "1") != "1":
+            await callback.answer("Оплата Stars сейчас отключена.", show_alert=True)
+            return
+        price = int(db.get_setting("price_stars", "150"))
+        await callback.bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title="Подписка CodeSchool",
+            description="Полный доступ ко всем урокам на 30 дней",
+            payload="sub_30d",
+            currency="XTR",
+            prices=[LabeledPrice(label="Подписка на 30 дней", amount=price)],
+        )
+        await callback.answer()
+
+    @dp.pre_checkout_query()
+    async def handle_pre_checkout(pre_checkout: PreCheckoutQuery) -> None:
+        await pre_checkout.answer(ok=True)
+
+    @dp.message(F.successful_payment)
+    async def handle_successful_payment(message: Message) -> None:
+        payment = message.successful_payment
+        db.record_payment(message.from_user.id, str(payment.total_amount), payment.telegram_payment_charge_id)
+        days = int(db.get_setting("sub_days", "30"))
+        new_until = db.grant_subscription(message.from_user.id, days)
+        until_str = datetime.fromtimestamp(new_until).strftime("%d.%m.%Y")
+        await message.answer(f"✅ Оплата прошла! Подписка активна до <b>{until_str}</b>.", parse_mode="HTML")
+
+    # -- CryptoBot (Crypto Pay API) ---------------------------------------
+    @dp.callback_query(F.data == "pay_crypto")
+    async def handle_pay_crypto(callback: CallbackQuery) -> None:
+        token = db.get_setting("crypto_pay_token", "")
+        if not token:
+            await callback.answer("Оплата криптой пока не настроена.", show_alert=True)
+            return
+        price_usd = float(db.get_setting("price_usd", "5"))
+        invoice = await cryptobot_create_invoice(
+            token, price_usd, "Подписка CodeSchool", payload=f"sub:{callback.from_user.id}"
+        )
+        if not invoice:
+            await callback.message.answer("⚠️ Не получилось создать счёт в CryptoBot. Проверь API-ключ в админке.")
+            await callback.answer()
+            return
+        db.create_pending_crypto_payment(callback.from_user.id, invoice["invoice_id"], price_usd)
+        await callback.message.answer(
+            f"💎 Счёт на ${price_usd:.2f} создан. Оплати по ссылке ниже, потом нажми «Проверить оплату».",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Оплатить", url=invoice["pay_url"])],
+                [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_crypto:{invoice['invoice_id']}")],
+            ]),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("check_crypto:"))
+    async def handle_check_crypto(callback: CallbackQuery) -> None:
+        token = db.get_setting("crypto_pay_token", "")
+        invoice_id = callback.data.split(":", 1)[1]
+        status = await cryptobot_check_invoice(token, int(invoice_id)) if token else None
+        if status == "paid":
+            row = db.get_pending_crypto_payment(invoice_id)
+            if row and row["status"] == "pending":
+                db.mark_crypto_payment_paid(invoice_id)
+                days = int(db.get_setting("sub_days", "30"))
+                new_until = db.grant_subscription(row["user_id"], days)
+                until_str = datetime.fromtimestamp(new_until).strftime("%d.%m.%Y")
+                await callback.message.edit_text(f"✅ Оплата подтверждена! Подписка активна до <b>{until_str}</b>.", parse_mode="HTML")
+            else:
+                await callback.answer("Уже оплачено ✅", show_alert=True)
+        else:
+            await callback.answer("Пока не вижу оплату. Если только что оплатил — подожди 10-20 секунд и попробуй ещё раз.", show_alert=True)
+
+    # -- Админ-панель -------------------------------------------------------
+    @dp.message(Command("admin"))
+    async def handle_admin_cmd(message: Message) -> None:
+        if not _is_owner(message.from_user.id, settings):
+            return
+        await message.answer("<b>🔐 Админ-панель</b>", parse_mode="HTML", reply_markup=build_admin_menu_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_menu")
+    async def handle_admin_menu(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await callback.message.edit_text("<b>🔐 Админ-панель</b>", parse_mode="HTML", reply_markup=build_admin_menu_keyboard(db))
+        await callback.answer()
+
+    @dp.callback_query(F.data == "admin_stats")
+    async def handle_admin_stats(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        total = db.user_count()
+        active_subs = db.active_subscribers_count()
+        text = f"📊 <b>Статистика</b>\n\nПользователей: <b>{total}</b>\nАктивных подписок: <b>{active_subs}</b>"
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=build_admin_menu_keyboard(db))
+        await callback.answer()
+
+    @dp.callback_query(F.data == "admin_sub_toggle")
+    async def handle_admin_sub_toggle(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        current = db.get_setting("subscription_required", "0")
+        db.set_setting("subscription_required", "0" if current == "1" else "1")
+        await callback.message.edit_reply_markup(reply_markup=build_admin_menu_keyboard(db))
+        await callback.answer("Переключено")
+
+    @dp.callback_query(F.data == "admin_sub_strict_toggle")
+    async def handle_admin_sub_strict_toggle(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        current = db.get_setting("subscription_strict", "0")
+        db.set_setting("subscription_strict", "0" if current == "1" else "1")
+        await callback.message.edit_reply_markup(reply_markup=build_admin_menu_keyboard(db))
+        await callback.answer("Переключено")
+
+    @dp.callback_query(F.data == "admin_unlimited_toggle")
+    async def handle_admin_unlimited_toggle(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        current = db.get_setting("unlimited_lessons", "0")
+        db.set_setting("unlimited_lessons", "0" if current == "1" else "1")
+        await callback.message.edit_reply_markup(reply_markup=build_admin_menu_keyboard(db))
+        await callback.answer("Переключено")
+
+    @dp.callback_query(F.data == "admin_channel")
+    async def handle_admin_channel(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_channel_username)
+        await callback.message.answer(
+            "Пришли юзернейм канала (например @mychannel) или '-' чтобы убрать кнопку подписки. "
+            "Канал должен быть публичным."
+        )
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_channel_username)
+    async def handle_channel_username_input(message: Message, state: FSMContext) -> None:
+        val = (message.text or "").strip()
+        db.set_setting("channel_username", "" if val == "-" else val.lstrip("@"))
+        await state.clear()
+        await message.answer("✅ Канал обновлён.", reply_markup=build_admin_menu_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_stars_price")
+    async def handle_admin_stars_price(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_stars_price)
+        await callback.message.answer("Пришли новую цену подписки в Stars (целое число), например: 150")
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_stars_price)
+    async def handle_stars_price_input(message: Message, state: FSMContext) -> None:
+        try:
+            price = int((message.text or "").strip())
+            assert price > 0
+        except Exception:
+            await message.answer("Нужно положительное целое число, например 150.")
+            return
+        db.set_setting("price_stars", str(price))
+        await state.clear()
+        await message.answer(f"✅ Цена: {price} Stars.", reply_markup=build_admin_menu_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_ai_model")
+    async def handle_admin_ai_model(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_ai_model)
+        await callback.message.answer(
+            f"Текущая модель по умолчанию (из настроек сервера): <code>{escape(settings.ai_model)}</code>\n\n"
+            "Пришли название модели, которое поддерживает твой AI-прокси (уточни у провайдера прокси, "
+            "какие модели доступны — гарантировать конкретные названия не могу, это зависит от него), "
+            "или '-' чтобы вернуть значение по умолчанию.",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_ai_model)
+    async def handle_ai_model_input(message: Message, state: FSMContext) -> None:
+        val = (message.text or "").strip()
+        db.set_setting("ai_model_override", "" if val == "-" else val)
+        await state.clear()
+        await message.answer("✅ Модель ИИ обновлена.", reply_markup=build_admin_menu_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_stars_toggle")
+    async def handle_admin_stars_toggle(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        current = db.get_setting("stars_enabled", "1")
+        db.set_setting("stars_enabled", "0" if current == "1" else "1")
+        await callback.message.edit_reply_markup(reply_markup=build_admin_menu_keyboard(db))
+        await callback.answer("Переключено")
+
+    @dp.callback_query(F.data == "admin_crypto_token")
+    async def handle_admin_crypto_token(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_crypto_token)
+        await callback.message.answer(
+            "Пришли API-токен CryptoBot (из @CryptoBot → Crypto Pay → Create App). "
+            "Он будет использоваться, чтобы выставлять счета, и деньги будут приходить "
+            "прямо на твой кошелёк в CryptoBot."
+        )
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_crypto_token)
+    async def handle_crypto_token_input(message: Message, state: FSMContext) -> None:
+        token = (message.text or "").strip()
+        if not token:
+            await message.answer("Пустой токен, попробуй ещё раз.")
+            return
+        db.set_setting("crypto_pay_token", token)
+        await state.clear()
+        try:
+            await message.delete()  # не хранить токен в открытой истории чата
+        except Exception:
+            pass
+        await message.answer("✅ CryptoBot-токен сохранён (сообщение с ним удалено из чата).",
+                              reply_markup=build_admin_menu_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_crypto_price")
+    async def handle_admin_crypto_price(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_crypto_price)
+        await callback.message.answer("Пришли новую цену подписки в USD (число), например: 5")
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_crypto_price)
+    async def handle_crypto_price_input(message: Message, state: FSMContext) -> None:
+        try:
+            price = float((message.text or "").replace(",", ".").strip())
+            assert price > 0
+        except Exception:
+            await message.answer("Нужно положительное число, например 5 или 4.99.")
+            return
+        db.set_setting("price_usd", str(price))
+        await state.clear()
+        await message.answer(f"✅ Цена подписки: {price} USD.", reply_markup=build_admin_menu_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_broadcast")
+    async def handle_admin_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_broadcast_text)
+        await callback.message.answer("Пришли текст для рассылки всем пользователям:")
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_broadcast_text)
+    async def handle_broadcast_text(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        text = message.text or ""
+        ids = db.all_user_ids()
+        sent, failed = 0, 0
+        status = await message.answer(f"Рассылка началась (0/{len(ids)})...")
+        for i, uid in enumerate(ids, start=1):
+            try:
+                await message.bot.send_message(uid, text)
+                sent += 1
+            except Exception:
+                failed += 1
+            if i % 25 == 0:
+                try:
+                    await status.edit_text(f"Рассылка идёт ({i}/{len(ids)})...")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+        await status.edit_text(f"✅ Рассылка завершена. Успешно: {sent}, ошибок: {failed}.")
+
+    @dp.callback_query(F.data == "admin_promo")
+    async def handle_admin_promo(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await callback.message.edit_text("🎁 <b>Промокоды</b>", parse_mode="HTML", reply_markup=build_admin_promo_keyboard(db))
+        await callback.answer()
+
+    @dp.callback_query(F.data == "admin_promo_create")
+    async def handle_admin_promo_create(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_promo_code_name)
+        await callback.message.answer("Введи название промокода (латиница/цифры, например SUMMER2026):")
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_promo_code_name)
+    async def handle_promo_code_name(message: Message, state: FSMContext) -> None:
+        code = (message.text or "").strip().upper()
+        if not code or not re.fullmatch(r"[A-ZА-ЯЁ0-9_-]{2,32}", code):
+            await message.answer("Код может содержать только буквы, цифры, «-» и «_», длина 2–32. Ещё раз:")
+            return
+        if db.get_promo(code):
+            await message.answer("Такой промокод уже есть. Введи другое название:")
+            return
+        await state.update_data(promo_code=code)
+        await state.set_state(AdminStates.waiting_promo_days)
+        await message.answer("Сколько дней подписки даёт этот промокод?")
+
+    @dp.message(AdminStates.waiting_promo_days)
+    async def handle_promo_days(message: Message, state: FSMContext) -> None:
+        try:
+            days = int((message.text or "").strip())
+            if days <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("Введи положительное целое число дней.")
+            return
+        await state.update_data(promo_days=days)
+        await state.set_state(AdminStates.waiting_promo_max)
+        await message.answer("Сколько разных пользователей смогут его активировать?")
+
+    @dp.message(AdminStates.waiting_promo_max)
+    async def handle_promo_max(message: Message, state: FSMContext) -> None:
+        try:
+            max_act = int((message.text or "").strip())
+            if max_act <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("Введи положительное целое число активаций.")
+            return
+        data = await state.get_data()
+        db.create_promo(data["promo_code"], data["promo_days"], max_act)
+        await state.clear()
+        await message.answer(
+            f"✅ Промокод <code>{data['promo_code']}</code> создан: {data['promo_days']} дн., лимит {max_act}.",
+            parse_mode="HTML", reply_markup=build_admin_promo_keyboard(db),
+        )
+
+    @dp.callback_query(F.data == "admin_promo_list")
+    async def handle_admin_promo_list(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        promos = db.list_promos()
+        if not promos:
+            await callback.message.edit_text("Промокодов пока нет.", reply_markup=build_admin_promo_keyboard(db))
+        else:
+            await callback.message.edit_text("Нажми, чтобы удалить:", reply_markup=build_promo_list_keyboard(promos))
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_promo_del:"))
+    async def handle_admin_promo_del(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        code = callback.data.split(":", 1)[1]
+        db.delete_promo(code)
+        await callback.answer(f"{code} удалён", show_alert=True)
+        promos = db.list_promos()
+        markup = build_promo_list_keyboard(promos) if promos else build_admin_promo_keyboard(db)
+        await callback.message.edit_reply_markup(reply_markup=markup)
+
+    @dp.callback_query(F.data == "admin_emoji")
+    async def handle_admin_emoji(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            "💎 Выбери, для какого текста задать премиум-эмодзи:",
+            reply_markup=build_emoji_admin_keyboard(db),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_emoji_pick:"))
+    async def handle_admin_emoji_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        key = callback.data.split(":", 1)[1]
+        await state.set_state(AdminStates.waiting_emoji_forward)
+        await state.update_data(emoji_key=key)
+        await callback.message.answer("Пришли сообщение ТОЛЬКО с одним премиум-эмодзи (просто отправь его как сообщение).")
+        await callback.answer()
+
+    @dp.callback_query(F.data == "admin_btnicons")
+    async def handle_admin_btnicons(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            "🔘 Иконки и цвет кнопок (Bot API 9.4). 💎 — установлен настоящий премиум-эмодзи. Выбери кнопку:",
+            reply_markup=build_button_icons_admin_keyboard(db),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_btnicon_pick:"))
+    async def handle_admin_btnicon_pick(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        key = callback.data.split(":", 1)[1]
+        label = BUTTON_ICON_DEFAULTS.get(key, ("", key))[1]
+        current_style = db.get_setting(f"btnstyle:{key}", "") or "по умолчанию"
+        await callback.message.answer(
+            f"Кнопка: {label}\nТекущий цвет: {current_style}\n\nЧто настроить?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Задать эмодзи (премиум или обычный)", callback_data=f"admin_btnicon_setemoji:{key}")],
+                [InlineKeyboardButton(text="🎨 Задать цвет", callback_data=f"admin_btnicon_setcolor:{key}")],
+                [InlineKeyboardButton(text="♻️ Сбросить всё", callback_data=f"admin_btnicon_reset:{key}")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_btnicons")],
+            ]),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_btnicon_setemoji:"))
+    async def handle_admin_btnicon_setemoji(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        key = callback.data.split(":", 1)[1]
+        await state.set_state(AdminStates.waiting_button_icon)
+        await state.update_data(btn_icon_key=key)
+        await callback.message.answer(
+            "Пришли эмодзи для этой кнопки одним сообщением:\n"
+            "• Если это премиум-эмодзи (и у тебя есть Telegram Premium) — сохраню настоящую "
+            "премиум-иконку на кнопке (Bot API 9.4, icon_custom_emoji_id).\n"
+            "• Если обычный эмодзи — сохраню как текстовый префикс (работает у всех, без Premium)."
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_btnicon_setcolor:"))
+    async def handle_admin_btnicon_setcolor(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        key = callback.data.split(":", 1)[1]
+        await callback.message.answer(
+            "Выбери цвет кнопки:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔵 Синий (primary)", callback_data=f"admin_btnicon_color:{key}:primary")],
+                [InlineKeyboardButton(text="🟢 Зелёный (success)", callback_data=f"admin_btnicon_color:{key}:success")],
+                [InlineKeyboardButton(text="🔴 Красный (danger)", callback_data=f"admin_btnicon_color:{key}:danger")],
+                [InlineKeyboardButton(text="⚪️ По умолчанию", callback_data=f"admin_btnicon_color:{key}:")],
+            ]),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_btnicon_color:"))
+    async def handle_admin_btnicon_color(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        _, key, color = callback.data.split(":", 2)
+        db.set_setting(f"btnstyle:{key}", color)
+        await callback.message.answer("✅ Цвет кнопки обновлён.", reply_markup=build_button_icons_admin_keyboard(db))
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("admin_btnicon_reset:"))
+    async def handle_admin_btnicon_reset(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        key = callback.data.split(":", 1)[1]
+        db.set_emoji(f"btn:{key}", "", "")
+        db.set_setting(f"btnstyle:{key}", "")
+        await callback.message.answer("♻️ Сброшено к дефолту.", reply_markup=build_button_icons_admin_keyboard(db))
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_button_icon)
+    async def handle_button_icon_input(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        key = data.get("btn_icon_key")
+        entities = message.entities or []
+        custom = next((e for e in entities if e.type == "custom_emoji"), None)
+        if custom:
+            if message.text:
+                utf16 = message.text.encode("utf-16-le")
+                raw = utf16[custom.offset * 2:(custom.offset + custom.length) * 2]
+                fallback = raw.decode("utf-16-le", errors="ignore") or "⭐"
+            else:
+                fallback = "⭐"
+            db.set_emoji(f"btn:{key}", custom.custom_emoji_id, fallback)
+            await state.clear()
+            await message.answer(
+                "✅ Премиум-иконка сохранена для кнопки (Bot API 9.4).",
+                reply_markup=build_button_icons_admin_keyboard(db),
+            )
+            return
+        icon = (message.text or "").strip().split()[0] if (message.text or "").strip() else ""
+        if not icon:
+            await message.answer("Пусто. Пришли один эмодзи.")
+            return
+        db.set_emoji(f"btn:{key}", "", icon)
+        await state.clear()
+        await message.answer("✅ Иконка кнопки обновлена (обычный эмодзи).", reply_markup=build_button_icons_admin_keyboard(db))
+
+    @dp.callback_query(F.data == "admin_emoji_new")
+    async def handle_admin_emoji_new(callback: CallbackQuery, state: FSMContext) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await state.set_state(AdminStates.waiting_new_emoji_key)
+        await callback.message.answer(
+            "Придумай короткое имя для нового слота латиницей без пробелов "
+            "(например: buy_button, lesson_task_icon) — потом используй {emoji:имя} в текстах, "
+            "которые сам редактируешь через рассылку/промо."
+        )
+        await callback.answer()
+
+    @dp.message(AdminStates.waiting_new_emoji_key)
+    async def handle_new_emoji_key(message: Message, state: FSMContext) -> None:
+        key = re.sub(r"[^a-zA-Z0-9_]", "", (message.text or "").strip())[:40]
+        if not key:
+            await message.answer("Имя должно содержать хотя бы одну латинскую букву/цифру. Попробуй ещё раз.")
+            return
+        db.set_emoji(key, "", "⭐")
+        await state.set_state(AdminStates.waiting_emoji_forward)
+        await state.update_data(emoji_key=key)
+        await message.answer(f"Слот «{key}» создан. Теперь пришли премиум-эмодзи одним сообщением.")
+
+    @dp.message(AdminStates.waiting_emoji_forward)
+    async def handle_emoji_forward(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        key = data.get("emoji_key")
+        entities = message.entities or []
+        custom = next((e for e in entities if e.type == "custom_emoji"), None)
+        if not custom:
+            await message.answer(
+                "⚠️ В этом сообщении нет entity custom_emoji — Telegram не прислал ID премиум-эмодзи.\n\n"
+                "Это значит один из двух вариантов:\n"
+                "1. У аккаунта, с которого ты отправляешь, нет Telegram Premium — тогда любой эмодзи "
+                "из панели премиум-эмодзи отправляется как ОБЫЧНЫЙ юникод-символ, без специального ID. "
+                "Без Premium сохранить кастомный эмодзи технически невозможно — это ограничение Telegram, "
+                "а не бота.\n"
+                "2. Ты переслал (forward) сообщение с эмодзи из другого чата — форвард иногда не сохраняет "
+                "entity. Пришли эмодзи как НОВОЕ сообщение, набрав его из панели эмодзи сам.\n\n"
+                "Если Premium есть — попробуй прислать эмодзи ещё раз одним отдельным сообщением."
+            )
+            return
+        # ВАЖНО: offset/length в Telegram entities считаются в UTF-16 code units,
+        # а Python-строки индексируются по code points — для эмодзи вне BMP это
+        # разные числа. Раньше здесь был баг: обычный срез text[offset:offset+length]
+        # съедал не тот кусок текста, из-за чего fallback-символ мог быть пустым/неверным.
+        if message.text:
+            utf16 = message.text.encode("utf-16-le")
+            raw = utf16[custom.offset * 2: (custom.offset + custom.length) * 2]
+            fallback = raw.decode("utf-16-le", errors="ignore") or "⭐"
+        else:
+            fallback = "⭐"
+        db.set_emoji(key, custom.custom_emoji_id, fallback)
+        await state.clear()
+        await message.answer(
+            f"✅ Эмодзи сохранён для «{TEXT_EMOJI_LABELS.get(key, key)}» (ID: {custom.custom_emoji_id}).",
+            reply_markup=build_emoji_admin_keyboard(db),
+        )
+
+    @dp.callback_query(F.data == "admin_backup")
+    async def handle_admin_backup(callback: CallbackQuery) -> None:
+        if not _is_owner(callback.from_user.id, settings):
+            await callback.answer()
+            return
+        await callback.answer("Готовлю файл...")
+        tmp_path = None
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tmp_path = os.path.join(tempfile.gettempdir(), f"backup_{stamp}.db")
+            db.backup_to(tmp_path)
+            await callback.message.answer_document(
+                FSInputFile(tmp_path, filename=f"backup_{stamp}.db"),
+                caption="💾 Бэкап базы данных (пользователи, прогресс, подписки, промокоды).",
+            )
+        except Exception:
+            logger.exception("Failed to send DB backup")
+            await callback.message.answer("Не удалось подготовить бэкап.")
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+
+# ======================================================================
+# ФОНОВАЯ ЗАДАЧА: ЕЖЕДНЕВНЫЕ НАПОМИНАНИЯ
+# ======================================================================
+
+
+async def reminder_loop(bot: Bot, db: Database, settings: Settings) -> None:
+    """Раз в минуту проверяет, у кого сейчас наступило время напоминания
+    (с учётом timezone_offset_hours), и шлёт сообщение — не чаще одного
+    раза в календарный день на пользователя."""
+    while True:
+        try:
+            now = datetime.utcnow() + timedelta(hours=settings.timezone_offset_hours)
+            now_hm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            for row in db.users_with_reminder():
+                if row["reminder_time"] == now_hm and row["last_reminder_date"] != today:
+                    db.mark_reminder_sent(row["user_id"], today)
+                    try:
+                        await bot.send_message(
+                            row["user_id"],
+                            "📖 Не забудь позаниматься сегодня! Открой «📚 Курсы» и продолжи с того же места.",
+                        )
+                    except Exception:
+                        logger.exception("Failed to send reminder to user_id=%s", row["user_id"])
+        except Exception:
+            logger.exception("Reminder loop iteration failed")
+        await asyncio.sleep(60)
+
+
+async def crypto_payments_loop(bot: Bot, db: Database) -> None:
+    """Раз в минуту сама проверяет неоплаченные крипто-счета и, если платёж
+    прошёл, сразу активирует подписку и уведомляет пользователя — не нужно
+    нажимать «Проверить оплату» вручную."""
+    while True:
+        try:
+            token = db.get_setting("crypto_pay_token", "")
+            if token:
+                for row in db.all_pending_crypto_payments():
+                    status = await cryptobot_check_invoice(token, int(row["invoice_id"]))
+                    if status == "paid":
+                        db.mark_crypto_payment_paid(row["invoice_id"])
+                        days = int(db.get_setting("sub_days", "30"))
+                        new_until = db.grant_subscription(row["user_id"], days)
+                        until_str = datetime.fromtimestamp(new_until).strftime("%d.%m.%Y")
+                        try:
+                            await bot.send_message(
+                                row["user_id"],
+                                f"✅ Оплата криптой подтверждена! Подписка активна до <b>{until_str}</b>.",
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            logger.exception("Failed to notify user_id=%s about crypto payment", row["user_id"])
+        except Exception:
+            logger.exception("Crypto payments loop iteration failed")
+        await asyncio.sleep(60)
+
+
+# ======================================================================
+# ENTRYPOINT
+# ======================================================================
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    settings = Settings.from_env()
+
+    db = Database(settings.db_path)
+    db.init_schema(settings.owner_id)
+
+    try:
+        backups_dir = os.path.join(os.path.dirname(os.path.abspath(settings.db_path)) or ".", "backups")
+        os.makedirs(backups_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db.backup_to(os.path.join(backups_dir, f"backup_{stamp}.db"))
+        existing = sorted(f for f in os.listdir(backups_dir) if f.startswith("backup_") and f.endswith(".db"))
+        for old in existing[:-10]:
+            try:
+                os.remove(os.path.join(backups_dir, old))
+            except OSError:
+                pass
+    except Exception:
+        logger.exception("Failed to create startup DB backup (continuing anyway)")
+
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=None))
+    dp = Dispatcher(storage=MemoryStorage())
+    register_handlers(dp, db, settings)
+
+    # Чистим ВСЁ, что могло остаться от предыдущей версии бота (/balance, /buy,
+    # публичный /admin и т.п.) — они могли быть выставлены в других scope/языках
+    # и поэтому не перезаписывались обычным set_my_commands.
+    stale_scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
+    for scope in stale_scopes:
+        for lang in (None, "ru", "en"):
+            try:
+                if lang:
+                    await bot.delete_my_commands(scope=scope, language_code=lang)
+                else:
+                    await bot.delete_my_commands(scope=scope)
+            except Exception:
+                logger.exception("Failed to clear stale bot commands (scope=%s, lang=%s)", scope, lang)
+
+    public_commands = [
+        BotCommand(command="start", description="Начать / перезапустить"),
+        BotCommand(command="help", description="Что умеет бот"),
+        BotCommand(command="promo", description="Активировать промокод"),
+        BotCommand(command="top", description="Топ пользователей"),
+    ]
+    await bot.set_my_commands(public_commands, scope=BotCommandScopeAllPrivateChats())
+
+    # /admin — только в списке команд владельца, остальные его вообще не видят
+    try:
+        await bot.set_my_commands(
+            public_commands + [BotCommand(command="admin", description="Админ-панель")],
+            scope=BotCommandScopeChat(chat_id=settings.owner_id),
+        )
+    except Exception:
+        logger.exception("Failed to set owner-only /admin command")
+
+    asyncio.create_task(reminder_loop(bot, db, settings))
+    asyncio.create_task(crypto_payments_loop(bot, db))
+
+    logger.info("Bot starting. DB file: %s", os.path.abspath(settings.db_path))
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
