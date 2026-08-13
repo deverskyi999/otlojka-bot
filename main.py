@@ -27,7 +27,11 @@ from aiogram.types import (
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+except ValueError:
+    OWNER_ID = 0
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен")
@@ -63,63 +67,61 @@ db = sqlite3.connect(
 
 db.row_factory = sqlite3.Row
 
-db.executescript(
-    """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        balance INTEGER DEFAULT 0,
-        purchases INTEGER DEFAULT 0,
-        joined_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    balance INTEGER DEFAULT 0,
+    purchases INTEGER DEFAULT 0,
+    joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 
-    CREATE TABLE IF NOT EXISTS gifts (
-        gift_id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        price INTEGER NOT NULL,
-        enabled INTEGER DEFAULT 1,
-        available INTEGER DEFAULT 1
-    );
+CREATE TABLE IF NOT EXISTS gifts (
+    gift_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    available INTEGER DEFAULT 1
+);
 
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        gift_id TEXT,
-        gift_title TEXT,
-        price INTEGER,
-        text TEXT,
-        status TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    gift_id TEXT,
+    gift_title TEXT,
+    price INTEGER,
+    text TEXT,
+    status TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount INTEGER,
-        payment_type TEXT,
-        payload TEXT UNIQUE,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount INTEGER,
+    payment_type TEXT,
+    payload TEXT UNIQUE,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 
-    CREATE TABLE IF NOT EXISTS free_spin (
-        user_id INTEGER PRIMARY KEY,
-        text TEXT DEFAULT '',
-        spins INTEGER DEFAULT 0
-    );
+CREATE TABLE IF NOT EXISTS free_spin (
+    user_id INTEGER PRIMARY KEY,
+    text TEXT DEFAULT '',
+    spins INTEGER DEFAULT 0
+);
 
-    CREATE TABLE IF NOT EXISTS emojis (
-        name TEXT PRIMARY KEY,
-        emoji_id TEXT
-    );
-    """
-)
+CREATE TABLE IF NOT EXISTS emojis (
+    name TEXT PRIMARY KEY,
+    emoji_id TEXT
+);
+""")
 
 db.commit()
 
 
 # =========================================================
-# DB HELPERS
+# DATABASE HELPERS
 # =========================================================
 
 def execute(sql, params=()):
@@ -169,7 +171,7 @@ def save_user(user):
     )
 
 
-def balance(user_id):
+def get_balance(user_id):
 
     row = one(
         """
@@ -191,10 +193,7 @@ def add_balance(user_id, amount):
         SET balance=balance+?
         WHERE user_id=?
         """,
-        (
-            amount,
-            user_id
-        )
+        (amount, user_id)
     )
 
 
@@ -235,11 +234,11 @@ EMOJI_NAMES = {
     "no_text": "Без текста",
     "confirm": "Отправить",
     "back": "Назад",
-    "admin": "Админ",
     "users": "Пользователи",
-    "add": "Добавить",
-    "withdraw": "Вывести",
-    "roulette": "Прокрутить бесплатно"
+    "add": "Добавить подарок",
+    "withdraw": "Вывести подарок",
+    "roulette": "Поехали",
+    "admin": "Админ"
 }
 
 
@@ -254,10 +253,7 @@ def get_emoji(name):
         (name,)
     )
 
-    if not row:
-        return None
-
-    return row["emoji_id"]
+    return row["emoji_id"] if row else None
 
 
 def set_emoji(name, emoji_id):
@@ -281,38 +277,30 @@ def set_emoji(name, emoji_id):
     )
 
 
-def button(
-    text,
-    callback,
-    emoji_name=None
-):
+def button(text, callback, emoji_name=None):
 
     kwargs = {
         "text": text,
         "callback_data": callback
     }
 
-    emoji_id = None
-
     if emoji_name:
+
         emoji_id = get_emoji(
             emoji_name
         )
 
-    if emoji_id:
-        kwargs[
-            "icon_custom_emoji_id"
-        ] = emoji_id
+        if emoji_id:
+            kwargs[
+                "icon_custom_emoji_id"
+            ] = emoji_id
 
     return InlineKeyboardButton(
         **kwargs
     )
 
 
-def text_emoji(
-    name,
-    fallback
-):
+def text_emoji(name, fallback):
 
     emoji_id = get_emoji(name)
 
@@ -384,7 +372,7 @@ async def start(message: Message):
             "Покупайте Telegram-подарки "
             "за Stars.\n\n"
             f"💰 Баланс: "
-            f"<b>{balance(message.from_user.id)} ⭐</b>"
+            f"<b>{get_balance(message.from_user.id)} ⭐</b>"
         ),
         reply_markup=main_menu()
     )
@@ -399,7 +387,7 @@ async def balance_command(message: Message):
 
     await message.answer(
         f"💰 Ваш баланс: "
-        f"<b>{balance(message.from_user.id)} ⭐</b>"
+        f"<b>{get_balance(message.from_user.id)} ⭐</b>"
     )
 
 
@@ -408,18 +396,6 @@ async def balance_command(message: Message):
 # =========================================================
 
 def get_gift_title(gift):
-
-    """
-    Telegram Bot API передаёт Gift ID,
-    цену и sticker, но не отдельное поле
-    с русским названием «Медведь».
-
-    Поэтому сначала используем сохранённое
-    название из БД.
-
-    Если админ ещё не переименовал подарок,
-    показываем понятное название по sticker emoji.
-    """
 
     old = one(
         """
@@ -457,9 +433,7 @@ async def sync_gifts():
 
     try:
 
-        result = (
-            await bot.get_available_gifts()
-        )
+        result = await bot.get_available_gifts()
 
     except Exception as error:
 
@@ -472,9 +446,7 @@ async def sync_gifts():
 
     for gift in result.gifts:
 
-        gift_id = str(
-            gift.id
-        )
+        gift_id = str(gift.id)
 
         title = get_gift_title(
             gift
@@ -496,7 +468,6 @@ async def sync_gifts():
             VALUES(?,?,?,?,?)
 
             ON CONFLICT(gift_id)
-
             DO UPDATE SET
                 price=excluded.price,
                 available=1
@@ -512,7 +483,7 @@ async def sync_gifts():
 
 
 # =========================================================
-# GIFTS MENU
+# GIFTS
 # =========================================================
 
 @dp.callback_query(F.data == "gifts")
@@ -537,7 +508,7 @@ async def gifts_menu(
     if not gifts:
 
         await call.message.answer(
-            "🎁 Сейчас доступных подарков нет."
+            "🎁 Сейчас подарков нет."
         )
 
         return
@@ -575,7 +546,7 @@ async def gifts_menu(
 
 
 # =========================================================
-# GIFT STATE
+# GIFT STATES
 # =========================================================
 
 class GiftState(StatesGroup):
@@ -608,7 +579,6 @@ async def choose_gift(
         FROM gifts
         WHERE gift_id=?
         AND enabled=1
-        AND available=1
         """,
         (gift_id,)
     )
@@ -616,18 +586,10 @@ async def choose_gift(
     if not gift:
 
         await call.message.answer(
-            "❌ Подарок больше недоступен."
+            "❌ Подарок не найден."
         )
 
         return
-
-    await state.update_data(
-        gift_id=gift["gift_id"],
-        title=gift["title"],
-        price=gift["price"]
-    )
-
-    await state.clear()
 
     await state.update_data(
         gift_id=gift["gift_id"],
@@ -639,7 +601,7 @@ async def choose_gift(
         (
             f"<b>{html.escape(gift['title'])}</b>\n\n"
             f"Цена: <b>{gift['price']} ⭐</b>\n\n"
-            "Добавить текст к подарку?"
+            "Добавить текст?"
         ),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -691,7 +653,7 @@ async def gift_add_text(
     )
 
     await call.message.answer(
-        "✍️ Отправьте текст для подарка.\n\n"
+        "✍️ Напишите текст для подарка.\n\n"
         "Максимум 128 символов."
     )
 
@@ -720,14 +682,14 @@ async def receive_gift_text(
     await state.clear()
 
     await create_pending_order(
-        message,
+        message.chat.id,
         data,
         text
     )
 
 
 # =========================================================
-# GIFT WITHOUT TEXT
+# WITHOUT TEXT
 # =========================================================
 
 @dp.callback_query(
@@ -753,23 +715,17 @@ async def gift_no_text(
         return
 
     await create_pending_order(
-        call.message,
+        call.from_user.id,
         data,
         ""
     )
 
 
-# =========================================================
-# PENDING ORDER
-# =========================================================
-
 async def create_pending_order(
-    message,
+    user_id,
     data,
     text
 ):
-
-    user_id = message.chat.id
 
     execute(
         """
@@ -810,13 +766,14 @@ async def create_pending_order(
         "\n\nТекст: без текста"
     )
 
-    await message.answer(
+    await bot.send_message(
+        user_id,
         (
             "<b>Подтверждение</b>\n\n"
             f"🎁 {html.escape(data['title'])}\n"
             f"💰 Цена: <b>{data['price']} ⭐</b>\n"
-            f"💳 Ваш баланс: "
-            f"<b>{balance(user_id)} ⭐</b>"
+            f"💳 Баланс: "
+            f"<b>{get_balance(user_id)} ⭐</b>"
             f"{text_part}"
         ),
         reply_markup=InlineKeyboardMarkup(
@@ -837,7 +794,7 @@ async def create_pending_order(
                 ],
                 [
                     button(
-                        "Назад",
+                        "Подарки",
                         "gifts",
                         "back"
                     )
@@ -886,13 +843,13 @@ async def send_pending_gift(
         order["price"]
     )
 
-    if balance(user_id) < price:
+    if get_balance(user_id) < price:
 
         await call.message.answer(
             (
                 "❌ Недостаточно Stars.\n\n"
                 f"Нужно: <b>{price} ⭐</b>\n"
-                f"Есть: <b>{balance(user_id)} ⭐</b>"
+                f"Есть: <b>{get_balance(user_id)} ⭐</b>"
             ),
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -924,16 +881,21 @@ async def send_pending_gift(
                 order["text"]
             )
 
-        await bot.send_gift(
+        result = await bot.send_gift(
             **kwargs
         )
+
+        if not result:
+
+            raise RuntimeError(
+                "Telegram вернул False"
+            )
 
     except Exception as error:
 
         await call.message.answer(
             (
-                "❌ Telegram не разрешил "
-                "отправить подарок.\n\n"
+                "❌ Не удалось отправить подарок.\n\n"
                 f"<code>"
                 f"{html.escape(str(error))}"
                 f"</code>"
@@ -942,18 +904,17 @@ async def send_pending_gift(
 
         return
 
-    # Только после успешного sendGift
-    # списываем внутренний баланс.
-
     if not take_balance(
         user_id,
         price
     ):
 
         await call.message.answer(
-            "⚠️ Подарок отправлен, "
-            "но внутренний баланс "
-            "не удалось списать."
+            (
+                "⚠️ Подарок отправлен, "
+                "но внутренний баланс "
+                "не удалось списать."
+            )
         )
 
         return
@@ -982,7 +943,7 @@ async def send_pending_gift(
             f"{html.escape(order['gift_title'])}\n"
             f"Списано: <b>{price} ⭐</b>\n"
             f"Баланс: "
-            f"<b>{balance(user_id)} ⭐</b>"
+            f"<b>{get_balance(user_id)} ⭐</b>"
         ),
         reply_markup=main_menu()
     )
@@ -1036,7 +997,7 @@ async def topup_amount(
     except ValueError:
 
         await message.answer(
-            "❌ Нужно написать число."
+            "❌ Введите число."
         )
 
         return
@@ -1070,8 +1031,7 @@ async def topup_amount(
         chat_id=message.from_user.id,
         title="Пополнение баланса",
         description=(
-            f"Пополнение баланса "
-            f"на {amount} Telegram Stars."
+            f"Пополнение на {amount} Stars."
         ),
         payload=payload,
         currency="XTR",
@@ -1166,8 +1126,7 @@ async def donate_amount(
         chat_id=message.from_user.id,
         title="Пожертвование проекту",
         description=(
-            f"Пожертвование "
-            f"{amount} Telegram Stars."
+            f"Пожертвование {amount} Stars."
         ),
         payload=payload,
         currency="XTR",
@@ -1202,13 +1161,9 @@ async def successful_payment(
     message: Message
 ):
 
-    payment = (
-        message.successful_payment
-    )
+    payment = message.successful_payment
 
-    payload = (
-        payment.invoice_payload
-    )
+    payload = payment.invoice_payload
 
     parts = payload.split(":")
 
@@ -1219,13 +1174,8 @@ async def successful_payment(
 
     try:
 
-        user_id = int(
-            parts[1]
-        )
-
-        amount = int(
-            parts[2]
-        )
+        user_id = int(parts[1])
+        amount = int(parts[2])
 
     except ValueError:
 
@@ -1276,7 +1226,7 @@ async def successful_payment(
                 "<b>✅ Баланс пополнен!</b>\n\n"
                 f"+{amount} ⭐\n"
                 f"Баланс: "
-                f"<b>{balance(user_id)} ⭐</b>"
+                f"<b>{get_balance(user_id)} ⭐</b>"
             ),
             reply_markup=main_menu()
         )
@@ -1302,11 +1252,9 @@ async def successful_payment(
             user_id
         )
 
-        return
-
 
 # =========================================================
-# FREE SPIN
+# FREE ROULETTE
 # =========================================================
 
 class FreeTextState(StatesGroup):
@@ -1418,13 +1366,13 @@ async def free_gift(
     await call.message.answer(
         (
             "<b>🎰 Получить бесплатно</b>\n\n"
-            "Одна попытка стоит <b>5 ⭐</b>.\n\n"
+            "Одна прокрутка — <b>2 ⭐</b>.\n\n"
             "🎰 Три одинаковых символа — "
-            "<b>бесплатная прокрутка</b>.\n\n"
+            "<b>1 бесплатная прокрутка</b>.\n\n"
             "7️⃣7️⃣7️⃣ — "
             "<b>❤️ Сердечко</b> бесплатно.\n\n"
-            "Если ничего не совпало — "
-            "ничего не выигрываете.\n\n"
+            "Если комбинация не выигрышная — "
+            "ничего не выпадает.\n\n"
             f"Бесплатных прокруток: "
             f"<b>{free_spins(call.from_user.id)}</b>"
         ),
@@ -1432,7 +1380,7 @@ async def free_gift(
             inline_keyboard=[
                 [
                     button(
-                        "Поехали",
+                        "Поехали — 2 ⭐",
                         "free_spin_start",
                         "roulette"
                     )
@@ -1448,6 +1396,10 @@ async def free_gift(
         )
     )
 
+
+# =========================================================
+# FREE TEXT
+# =========================================================
 
 @dp.callback_query(
     F.data == "free_text"
@@ -1498,10 +1450,17 @@ async def receive_free_text(
     await state.clear()
 
     await message.answer(
-        "<b>✅ Текст сохранён!</b>\n\n"
-        "Теперь запускайте рулетку."
+        (
+            "<b>✅ Текст сохранён!</b>\n\n"
+            "Теперь нажмите "
+            "«Получить бесплатно»."
+        )
     )
 
+
+# =========================================================
+# START SPIN
+# =========================================================
 
 @dp.callback_query(
     F.data == "free_spin_start"
@@ -1514,8 +1473,7 @@ async def free_spin_start(
 
     user_id = call.from_user.id
 
-    # Если есть бесплатная прокрутка,
-    # используем её.
+    # Сначала используем бесплатную прокрутку.
 
     if take_free_spin(user_id):
 
@@ -1529,12 +1487,12 @@ async def free_spin_start(
 
         return
 
-    # Иначе оплата 5 Stars.
+    # Обычная прокрутка стоит 2 Stars.
 
     payload = (
         f"free_spin:"
         f"{user_id}:"
-        f"5:"
+        f"2:"
         f"{secrets.token_hex(12)}"
     )
 
@@ -1542,19 +1500,23 @@ async def free_spin_start(
         chat_id=user_id,
         title="🎰 Прокрутка",
         description=(
-            "Одна попытка рулетки — 5 Stars."
+            "Одна прокрутка рулетки — 2 Stars."
         ),
         payload=payload,
         currency="XTR",
         prices=[
             LabeledPrice(
                 label="Прокрутка",
-                amount=5
+                amount=2
             )
         ],
         provider_token=""
     )
 
+
+# =========================================================
+# SLOT
+# =========================================================
 
 async def send_slot(user_id):
 
@@ -1568,7 +1530,7 @@ async def send_slot(user_id):
         emoji="🎰"
     )
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
 
     await process_slot(
         user_id,
@@ -1588,14 +1550,10 @@ def decode_slot(value):
 
     n = value - 1
 
-    a = n & 3
-    b = (n >> 2) & 3
-    c = (n >> 4) & 3
-
     return (
-        a,
-        b,
-        c
+        n & 3,
+        (n >> 2) & 3,
+        (n >> 4) & 3
     )
 
 
@@ -1618,13 +1576,6 @@ async def process_slot(
             "Вы выиграли ❤️ Сердечко!"
         )
 
-        # Для настоящей отправки сердечка
-        # Telegram должен иметь доступный Gift ID.
-        #
-        # Он берётся автоматически из каталога:
-        # ищем подарок, который администратор
-        # назвал «Сердце» или «Сердечко».
-
         heart = one(
             """
             SELECT gift_id
@@ -1641,8 +1592,8 @@ async def process_slot(
             await bot.send_message(
                 user_id,
                 (
-                    "⚠️ Сердечко ещё не настроено "
-                    "в каталоге подарков."
+                    "⚠️ Подарок «Сердечко» "
+                    "ещё не настроен в каталоге."
                 )
             )
 
@@ -1662,7 +1613,6 @@ async def process_slot(
             }
 
             if text:
-
                 kwargs["text"] = text
 
             await bot.send_gift(
@@ -1674,8 +1624,8 @@ async def process_slot(
             await bot.send_message(
                 user_id,
                 (
-                    "❌ Telegram не разрешил "
-                    "отправить сердечко.\n\n"
+                    "❌ Не удалось отправить "
+                    "сердечко.\n\n"
                     f"<code>"
                     f"{html.escape(str(error))}"
                     f"</code>"
@@ -1708,7 +1658,7 @@ async def process_slot(
             user_id,
             (
                 "<b>🎉 Три одинаковых!</b>\n\n"
-                "Получена "
+                "Вам начислена "
                 "<b>1 бесплатная прокрутка</b> 🎰"
             )
         )
@@ -1833,7 +1783,7 @@ async def admin_users(
 
         return
 
-    buttons = []
+    keyboard = []
 
     for user in users:
 
@@ -1844,7 +1794,7 @@ async def admin_users(
             else "без username"
         )
 
-        buttons.append([
+        keyboard.append([
             InlineKeyboardButton(
                 text=(
                     f"{username} | "
@@ -1859,16 +1809,12 @@ async def admin_users(
 
     await call.message.answer(
         "<b>👥 Пользователи</b>\n\n"
-        "Нажмите на пользователя:",
+        "Выберите пользователя:",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
+            inline_keyboard=keyboard
         )
     )
 
-
-# =========================================================
-# ADMIN USER
-# =========================================================
 
 @dp.callback_query(
     F.data.startswith("admin_user:")
@@ -1901,11 +1847,6 @@ async def admin_user(
     )
 
     if not user:
-
-        await call.message.answer(
-            "Пользователь не найден."
-        )
-
         return
 
     username = (
@@ -1938,7 +1879,7 @@ async def admin_user(
                 ],
                 [
                     button(
-                        "Назад",
+                        "Пользователи",
                         "admin_users",
                         "back"
                     )
@@ -1965,7 +1906,7 @@ async def admin_spin(
         return
 
     await call.answer(
-        "Прокрутка добавлена!"
+        "Добавлено!"
     )
 
     user_id = int(
@@ -1993,8 +1934,7 @@ async def admin_spin(
             user_id,
             (
                 "<b>🎰 Вам выдали "
-                "бесплатную прокрутку!</b>\n\n"
-                "Откройте «Получить бесплатно»."
+                "бесплатную прокрутку!</b>"
             )
         )
 
@@ -2030,15 +1970,7 @@ async def admin_gifts(
         """
     )
 
-    if not gifts:
-
-        await call.message.answer(
-            "Каталог пуст."
-        )
-
-        return
-
-    buttons = []
+    keyboard = []
 
     for gift in gifts:
 
@@ -2048,7 +1980,7 @@ async def admin_gifts(
             else "🔴"
         )
 
-        buttons.append([
+        keyboard.append([
             InlineKeyboardButton(
                 text=(
                     f"{status} "
@@ -2063,11 +1995,9 @@ async def admin_gifts(
         ])
 
     await call.message.answer(
-        "<b>🎁 Каталог</b>\n\n"
-        "Нажатие отключает/включает "
-        "подарок для пользователей.",
+        "<b>🎁 Каталог подарков</b>",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
+            inline_keyboard=keyboard
         )
     )
 
@@ -2125,7 +2055,7 @@ async def toggle_gift(
 
 
 # =========================================================
-# ADMIN ADD/RENAME GIFT
+# ADMIN ADD GIFT
 # =========================================================
 
 class AddGiftState(StatesGroup):
@@ -2155,10 +2085,10 @@ async def admin_add(
     )
 
     await call.message.answer(
-        "<b>Добавить/переименовать подарок</b>\n\n"
-        "Отправьте технический Gift ID.\n\n"
-        "Он нужен только администратору "
-        "и никогда не показывается пользователям."
+        "<b>Добавление подарка</b>\n\n"
+        "Отправьте Gift ID.\n\n"
+        "ID нужен только для работы API "
+        "и пользователю не показывается."
     )
 
 
@@ -2171,10 +2101,8 @@ async def admin_add_id(
     state: FSMContext
 ):
 
-    gift_id = message.text.strip()
-
     await state.update_data(
-        gift_id=gift_id
+        gift_id=message.text.strip()
     )
 
     await state.set_state(
@@ -2183,8 +2111,7 @@ async def admin_add_id(
 
     await message.answer(
         "Введите название.\n\n"
-        "Например:\n"
-        "<code>Медведь</code>"
+        "Например: <code>Медведь</code>"
     )
 
 
@@ -2202,7 +2129,7 @@ async def admin_add_title(
     if len(title) > 64:
 
         await message.answer(
-            "Максимум 64 символа."
+            "❌ Максимум 64 символа."
         )
 
         return
@@ -2238,7 +2165,15 @@ async def admin_add_price(
     except ValueError:
 
         await message.answer(
-            "Введите число."
+            "❌ Введите число."
+        )
+
+        return
+
+    if price < 0:
+
+        await message.answer(
+            "❌ Цена не может быть отрицательной."
         )
 
         return
@@ -2276,7 +2211,7 @@ async def admin_add_price(
 
     await message.answer(
         (
-            "<b>✅ Готово!</b>\n\n"
+            "<b>✅ Подарок сохранён!</b>\n\n"
             f"Название: "
             f"<b>{html.escape(data['title'])}</b>\n"
             f"Цена: <b>{price} ⭐</b>"
@@ -2313,11 +2248,11 @@ async def admin_withdraw(
         """
     )
 
-    buttons = []
+    keyboard = []
 
     for gift in gifts:
 
-        buttons.append([
+        keyboard.append([
             InlineKeyboardButton(
                 text=(
                     f"{gift['title']} — "
@@ -2331,13 +2266,10 @@ async def admin_withdraw(
         ])
 
     await call.message.answer(
-        (
-            "<b>📤 Вывести подарок</b>\n\n"
-            "Подарок будет отправлен "
-            "на OWNER_ID."
-        ),
+        "<b>📤 Вывод подарка</b>\n\n"
+        "Подарок будет отправлен OWNER_ID.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
+            inline_keyboard=keyboard
         )
     )
 
@@ -2452,11 +2384,8 @@ async def admin_emojis(
     await call.message.answer(
         (
             "<b>✨ Premium Emoji</b>\n\n"
-            "Выберите любую кнопку.\n"
-            "Затем отправьте Premium Emoji "
-            "одним сообщением.\n\n"
-            "Эта настройка применяется "
-            "к соответствующей кнопке."
+            "Выберите элемент и отправьте "
+            "Premium Emoji отдельным сообщением."
         ),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=keyboard
@@ -2495,8 +2424,7 @@ async def choose_emoji(
     await call.message.answer(
         (
             f"<b>{EMOJI_NAMES[key]}</b>\n\n"
-            "Отправьте Premium Emoji "
-            "отдельным сообщением."
+            "Отправьте Premium Emoji."
         )
     )
 
@@ -2548,14 +2476,14 @@ async def receive_emoji(
     await message.answer(
         (
             "<b>✅ Premium Emoji сохранён!</b>\n\n"
-            f"Кнопка: "
+            f"Элемент: "
             f"<b>{EMOJI_NAMES[data['emoji_key']]}</b>"
         )
     )
 
 
 # =========================================================
-# ADMIN BOT BALANCE
+# ADMIN BALANCE
 # =========================================================
 
 @dp.callback_query(
@@ -2574,9 +2502,7 @@ async def admin_balance(
 
     try:
 
-        result = (
-            await bot.get_my_star_balance()
-        )
+        result = await bot.get_my_star_balance()
 
         await call.message.answer(
             (
@@ -2598,7 +2524,7 @@ async def admin_balance(
 
 
 # =========================================================
-# START
+# START BOT
 # =========================================================
 
 async def main():
@@ -2606,15 +2532,15 @@ async def main():
     print(
         "================================"
     )
-
     print(
         "GIFT BOT STARTED"
     )
-
     print(
         f"OWNER_ID: {OWNER_ID}"
     )
-
+    print(
+        "ROULETTE PRICE: 2 XTR"
+    )
     print(
         "================================"
     )
